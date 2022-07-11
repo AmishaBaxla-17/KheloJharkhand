@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <!-- CSS only -->
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css"
+rel="stylesheet" integrity="sha384-1BmE4kWBq78iYhFldvKuhfTAU6auU8tT94WrHftjDbrCEXSU1oBoqyl2QvZ6jIW3" crossorigin="anonymous"> 
+<!-- JavaScript Bundle with Popper -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js" 
+integrity="sha384-ka7Sk0Gln4gmtz2MlQnikT1wXgYsOg+OMhuP+IlRH9sENBO0LRn5q+8nbTov4+1p" crossorigin="anonymous"></script> 
+    <link rel="icon" href="{{ url_for('static',filename='/images1/logo2.png')}}" type="images1/icon type">
+   
+    <title>Player Signup</title>
+    <style>
+        * body{        
+    margin:0px ;
+    padding:0px ;
+    font-family:sans-serif ;
+    background-position: center;
+    background-size:cover ;
+    background-image:url(../static/images1/player_signup.avif) ;
+    width:100% ;
+    background-repeat:no-repeat ;
+    font-family:sans-serif ;
+    
+    
+    
+   
+  }
+  .signup-form{
+    position:calc(50% -50px);
+    margin:8% auto  ;
+    background-color: #fff;
+    padding:20px  ;
+    /*width:320px;*/
+    width:400px ;
+    box-shadow:0 0 3px 0 rgba(0,0,0,0.3) ;
+    text-align: center;
+    position: relative;
+    
+  
+    
+   
+    
+  }
+  .signup-form h1{
+    color:#1c8adb;
+    margin-bottom:20px ;
+    margin-top:30px ;
+  
+
+  }
+  .input-box{
+    border-radius: 20px;
+    width:100%;
+   height:6vh;
+    margin:10px 0;
+    border:1px solid #999;
+    outline: none;
+  }
+ .signup-button{
+    color:#fff;
+    width: 100% ;
+    padding:10px ;
+    border-radius:20px ;
+    font-size:15px ;
+    margin:10px 0 ;
+    border:none;
+    outline:none;
+    cursor:pointer;
+    background-color: #1c8adb;
+    margin-bottom:20px ;
+
+  }
+  .signup-button:hover{
+   background-color:blueviolet;
+  }
+  .login-button{
+    color:#fff;
+    width: 100% ;
+    padding:10px ;
+    border-radius:20px ;
+    font-size:15px ;
+    margin:10px 0 ;
+    border:none;
+    outline:none;
+    cursor:pointer;
+    background-color: hsl(195, 65%, 40%);
+
+  }
+  .login-button:hover{
+   background-color:blueviolet;
+  }
+  .upload-image{
+    margin-top:5px ;
+    padding-right:80px;
+    padding-bottom: 0px;
+  }
+  a{
+    text-decoration:none ;
+  }
+  .or{
+    background:#fff;
+    width:30px;
+    margin:-19px auto 10px;
+    
+    
+  }
+  .hr{
+    margin-top: 20px ;
+    
+    width:80%;
+  }
+  .checkbox{
+    background-color: #fff;
+  }
+
+/*.img{
+    
+    margin-top:0px ;
+    width:"120px";
+    margin-bottom: 0px;
+    
+    
+  }*/
+  .user-image{
+    background: url(../static/images1/logo1.png);
+    background-repeat: no-repeat;
+    width:40% ;
+    height:40% ;
+    background-size:100% ;
+    position: absolute;
+    top:-70px ;
+    left:110px ;
+  }
+  .signup-form p1{
+    padding-top:50px ;
+   padding-right:180px;
+   
+  }
+  .text-light{
+    color: #fff;
+  }
+  .nav-link:hover{
+   background-color:rgb(174, 238, 91);
+
+  }
+         
+    </style>
+</head>
+<body>
+  <nav class="navbar navbar-expand-lg navbar-light bg-danger">
+    <div class="container-fluid">
+    
+        <a class="navbar-brand">
+            <img src="{{ url_for('static',filename='/images1/logo2.png')}}"  alt="" width="30" height="24" class="d-inline-block align-text-top">
+            Khelo Jharkhand
+          </a>
+       
+      
+      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+      <div class="collapse navbar-collapse" id="navbarSupportedContent">
+        <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+          <li class="nav-item">
+            <a class="nav-link active" aria-current="page" href="/team_player">Player</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link" href="/team_player_list">Players List</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link" href="/team_game_search">Upcoming Games</a>
+          </li>
+
+          <li class="nav-item">
+            <a class="nav-link" href="/team_applied_list">Applied Games</a>
+          </li>
+        </ul>
+        <ul class="navbar-nav">
+        <li class="nav-item dropdown">
+            <a class="nav-link dropdown-toggle" href="#" id="navbarDropdown" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+              {{session['team_name']}}
+            </a>
+            <ul class="dropdown-menu" aria-labelledby="navbarDropdown">
+              <li><a class="dropdown-item" href="/team_profile">Profile</a></li>
+              <li><a class="dropdown-item" href="/team_logout">Logout</a></li>
+             
+            </ul>
+          </li>
+          </ul>
+        
+      </div>
+    </div>
+  </nav>
+   {% with messages = get_flashed_messages() %}
+   {% if messages %}
+   {% for message in messages %}
+   <div class="alert alert-success" role="alert">
+     {{message}}
+  <!-- <div> <a href="\player_login">Click here to login now</a></div>-->
+   </div>
+   {% endfor %}
+   {% endif %}
+   {% endwith %}
+    <div class="signup-form" style="background: #fff;">
+      <div class="user-image"></div>
+  
+    
+   <!--<img src="{{ url_for('static',filename='images1/logo1.png')}}" alt=""  style="background: #fff;" width="120"; height="120">-->
+      
+            <h1 style="background: #fff;" >Player Signup</h1>
+           <form action="/team_player_insert" method="post" style="background: #fff;" style="padding-right:10px ;" enctype="multipart/form-data">
+           {% if(request.args.get('msg')!=None)%}
+           <div class="alert alert-success" role="alert">
+             {{request.args.get('msg')}}
+
+           </div>
+           {% endif %}    
+           <!--<input type="email" class="input-box" placeholder="Enter your email" name="email" style="background: #fff;">-->
+
+          <!--  <input type="password" class="input-box" placeholder="Enter your password" name="password" style="background: #fff;">-->
+               <input type="text"  class="input-box" placeholder="Enter your name" name="name" style="background: #fff;" >
+               
+               <input type="text" class="input-box"  placeholder="Enter your mobile no." name="mobile" style="background: #fff;">
+
+               <p1 style=" padding-right:200px;">Enter your dob:</p1>
+               <input type="date" class="input-box"  placeholder="Enter your dob" name="dob" style="background: #fff; margin-top:2px ; ">
+               <input type="text" class="input-box"  placeholder="Enter your UID" name="uid" style="background: #fff; margin-top:2px ; ">
+               
+              <input type="text" class="input-box" placeholder="Enter your address" name="address" style="background: #fff;">
+
+             <p1>Upload your image:</p1>
+                <input type="file"  placeholder="Upload your photo" name="photo" style="background: #fff;"class="upload-image">
+            <!-- <div> <img src="../static/player1/" width="200px" height="50px"></div>-->
+             <!--   <input type="text" class="input-box" name="captcha" placeholder="Enter the captcha" style="background: #fff;">-->
+
+             <p style="background: #fff; margin-top:20px ;"><span style="background: #fff;" ><input type="checkbox" style="background: #fff;" required></span>  I agree to the terms and services.</p>
+            <!-- <input  type="submit"  style="background: #0d6efd ;" value="SIGN UP" class=" signup-button">-->
+             <button class="signup-button " type="submit">SIGN UP</button>
+            </form>
+             <!-- <hr>
+             <p class="or">OR</p>
+            
+            <p  style="background: #fff;">Do you have an account ?<button class="login-button"><a href="/player_login " class="text-light">SIGN IN / LOGIN</a></button>
+             </p>
+            -->
+           
+           
+       </div>
+        
+    </div>
+    </body>
+    </html>
