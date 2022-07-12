@@ -1,1 +1,2 @@
-markupsafe
+mysql
+mysqlx
