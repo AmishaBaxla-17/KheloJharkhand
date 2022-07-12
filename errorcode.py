@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # MySQL Connector/Python - MySQL driver written in Python.
-# Copyright (c) 2013, 2015, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2013, 2016, Oracle and/or its affiliates. All rights reserved.
 
 # MySQL Connector/Python is licensed under the terms of the GPLv2
 # <http://www.gnu.org/licenses/old-licenses/gpl-2.0.html>, like most
@@ -24,8 +24,8 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA 
 
 # This file was auto-generated.
-_GENERATED_ON = '2015-12-13'
-_MYSQL_VERSION = (5, 7, 10)
+_GENERATED_ON = '2016-05-31'
+_MYSQL_VERSION = (5, 7, 12)
 
 """This module contains the MySQL Server and Client error codes"""
 
@@ -1092,6 +1092,17 @@ ER_TABLE_NEEDS_UPG_PART = 3172
 ER_CANT_WAIT_FOR_EXECUTED_GTID_SET_WHILE_OWNING_A_GTID = 3173
 ER_CANNOT_ADD_FOREIGN_BASE_COL_VIRTUAL = 3174
 ER_CANNOT_CREATE_VIRTUAL_INDEX_CONSTRAINT = 3175
+ER_ERROR_ON_MODIFYING_GTID_EXECUTED_TABLE = 3176
+ER_LOCK_REFUSED_BY_ENGINE = 3177
+ER_UNSUPPORTED_ALTER_ONLINE_ON_VIRTUAL_COLUMN = 3178
+ER_MASTER_KEY_ROTATION_NOT_SUPPORTED_BY_SE = 3179
+ER_MASTER_KEY_ROTATION_ERROR_BY_SE = 3180
+ER_MASTER_KEY_ROTATION_BINLOG_FAILED = 3181
+ER_MASTER_KEY_ROTATION_SE_UNAVAILABLE = 3182
+ER_TABLESPACE_CANNOT_ENCRYPT = 3183
+ER_INVALID_ENCRYPTION_OPTION = 3184
+ER_CANNOT_FIND_KEY_IN_KEYRING = 3185
+ER_CAPACITY_EXCEEDED_IN_PARSER = 3186
 CR_UNKNOWN_ERROR = 2000
 CR_SOCKET_CREATE_ERROR = 2001
 CR_CONNECTION_ERROR = 2002

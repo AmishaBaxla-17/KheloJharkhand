@@ -21,31 +21,37 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Constants."""
+"""This module handles compatibility issues between Python 2 and Python 3."""
 
-from collections import namedtuple
-
-
-def create_enum(name, fields, values=None):
-    """Emulates an enum by creating a namedtuple.
-
-    Args:
-        name (string): The type name.
-        fields (tuple): The fields names.
-        values (tuple): The values of the fields.
-
-    Returns:
-        namedtuple: A namedtuple object.
-    """
-    Enum = namedtuple(name, fields, verbose=False)
-    if values is None:
-        return Enum(*fields)
-    return Enum(*values)
+import sys
+import decimal
+import binascii
 
 
-Algorithms = create_enum("Algorithms", ("MERGE", "TMPTABLE", "UNDEFINED"))
-Securities = create_enum("Securities", ("DEFINER", "INVOKER"))
-CheckOptions = create_enum("CheckOptions", ("CASCADED", "LOCAL"))
+PY3 = sys.version_info.major == 3
 
 
-__all__ = ["Algorithms", "Securities", "CheckOptions"]
+if PY3:
+    from urllib.parse import urlparse, unquote, parse_qsl
+
+    def hexlify(data):
+        return binascii.hexlify(data).decode("utf-8")
+
+    NUMERIC_TYPES = (int, float, decimal.Decimal,)
+    INT_TYPES = (int,)
+    UNICODE_TYPES = (str,)
+    STRING_TYPES = (str,)
+    BYTE_TYPES = (bytearray, bytes,)
+
+
+else:
+    from urlparse import urlparse, unquote, parse_qsl
+
+    def hexlify(data):
+        return data.encode("hex")
+
+    NUMERIC_TYPES = (int, float, decimal.Decimal, long,)
+    INT_TYPES = (int, long,)
+    UNICODE_TYPES = (unicode,)
+    STRING_TYPES = (str, unicode,)
+    BYTE_TYPES = (bytearray,)

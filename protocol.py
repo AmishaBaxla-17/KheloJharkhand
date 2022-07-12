@@ -1,5 +1,5 @@
 # MySQL Connector/Python - MySQL driver written in Python.
-# Copyright (c) 2009, 2016, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2016, Oracle and/or its affiliates. All rights reserved.
 
 # MySQL Connector/Python is licensed under the terms of the GPLv2
 # <http://www.gnu.org/licenses/old-licenses/gpl-2.0.html>, like most
@@ -21,712 +21,355 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Implements the MySQL Client/Server protocol
-"""
+"""Implementation of the X protocol for MySQL servers."""
 
 import struct
-import datetime
-from decimal import Decimal
 
-from .constants import (
-    FieldFlag, ServerCmd, FieldType, ClientFlag, MAX_MYSQL_TABLE_COLUMNS)
-from . import errors, utils
-from .authentication import get_auth_plugin
-from .catch23 import PY2, struct_unpack
-from .errors import get_exception
+from .protobuf import mysqlx_pb2 as MySQLx
+from .protobuf import mysqlx_session_pb2 as MySQLxSession
+from .protobuf import mysqlx_sql_pb2 as MySQLxSQL
+from .protobuf import mysqlx_notice_pb2 as MySQLxNotice
+from .protobuf import mysqlx_datatypes_pb2 as MySQLxDatatypes
+from .protobuf import mysqlx_resultset_pb2 as MySQLxResultset
+from .protobuf import mysqlx_crud_pb2 as MySQLxCrud
+from .protobuf import mysqlx_expr_pb2 as MySQLxExpr
+from .protobuf import mysqlx_connection_pb2 as MySQLxConnection
+from .result import ColumnMetaData
+from .compat import STRING_TYPES, INT_TYPES
+from .dbdoc import DbDoc
+from .errors import InterfaceError, OperationalError, ProgrammingError
+from .expr import (ExprParser, build_null_scalar, build_string_scalar,
+                   build_bool_scalar, build_double_scalar, build_int_scalar)
 
 
-class MySQLProtocol(object):
-    """Implements MySQL client/server protocol
+_SERVER_MESSAGES = [
+    (MySQLx.ServerMessages.SESS_AUTHENTICATE_CONTINUE,
+     MySQLxSession.AuthenticateContinue),
+    (MySQLx.ServerMessages.SESS_AUTHENTICATE_OK,
+     MySQLxSession.AuthenticateOk),
+    (MySQLx.ServerMessages.SQL_STMT_EXECUTE_OK, MySQLxSQL.StmtExecuteOk),
+    (MySQLx.ServerMessages.ERROR, MySQLx.Error),
+    (MySQLx.ServerMessages.NOTICE, MySQLxNotice.Frame),
+    (MySQLx.ServerMessages.RESULTSET_COLUMN_META_DATA,
+     MySQLxResultset.ColumnMetaData),
+    (MySQLx.ServerMessages.RESULTSET_ROW, MySQLxResultset.Row),
+    (MySQLx.ServerMessages.RESULTSET_FETCH_DONE, MySQLxResultset.FetchDone),
+    (MySQLx.ServerMessages.RESULTSET_FETCH_DONE_MORE_RESULTSETS,
+     MySQLxResultset.FetchDoneMoreResultsets),
+    (MySQLx.ServerMessages.OK, MySQLx.Ok),
+    (MySQLx.ServerMessages.CONN_CAPABILITIES, MySQLxConnection.Capabilities),
+]
 
-    Create and parses MySQL packets.
-    """
 
-    def _connect_with_db(self, client_flags, database):
-        """Prepare database string for handshake response"""
-        if client_flags & ClientFlag.CONNECT_WITH_DB and database:
-            return database.encode('utf8') + b'\x00'
-        return b'\x00'
+def encode_to_bytes(value, encoding="utf-8"):
+    return value if isinstance(value, bytes) else value.encode(encoding)
 
-    def _auth_response(self, client_flags, username, password, database,
-                       auth_plugin, auth_data, ssl_enabled):
-        """Prepare the authentication response"""
-        if not password:
-            return b'\x00'
 
-        try:
-            auth = get_auth_plugin(auth_plugin)(
-                auth_data,
-                username=username, password=password, database=database,
-                ssl_enabled=ssl_enabled)
-            plugin_auth_response = auth.auth_response()
-        except (TypeError, errors.InterfaceError) as exc:
-            raise errors.ProgrammingError(
-                "Failed authentication: {0}".format(str(exc)))
+class MessageReaderWriter(object):
+    def __init__(self, socket_stream):
+        self._stream = socket_stream
+        self._msg = None
 
-        if client_flags & ClientFlag.SECURE_CONNECTION:
-            resplen = len(plugin_auth_response)
-            auth_response = struct.pack('<B', resplen) + plugin_auth_response
-        else:
-            auth_response = plugin_auth_response + b'\x00'
-        return auth_response
+    def push_message(self, msg):
+        if self._msg is not None:
+            raise OperationalError("Message push slot is full")
+        self._msg = msg
 
-    def make_auth(self, handshake, username=None, password=None, database=None,
-                  charset=33, client_flags=0,
-                  max_allowed_packet=1073741824, ssl_enabled=False,
-                  auth_plugin=None):
-        """Make a MySQL Authentication packet"""
+    def read_message(self):
+        if self._msg is not None:
+            m = self._msg
+            self._msg = None
+            return m
+        return self._read_message()
 
-        try:
-            auth_data = handshake['auth_data']
-            auth_plugin = auth_plugin or handshake['auth_plugin']
-        except (TypeError, KeyError) as exc:
-            raise errors.ProgrammingError(
-                "Handshake misses authentication info ({0})".format(exc))
+    def _read_message(self):
+        hdr = self._stream.read(5)
+        msg_len, msg_type = struct.unpack("<LB", hdr)
+        payload = self._stream.read(msg_len - 1)
 
-        if not username:
-            username = b''
-        try:
-            username_bytes = username.encode('utf8')  # pylint: disable=E1103
-        except AttributeError:
-            # Username is already bytes
-            username_bytes = username
-        packet = struct.pack('<IIB{filler}{usrlen}sx'.format(
-            filler='x' * 23, usrlen=len(username_bytes)),
-                             client_flags, max_allowed_packet, charset,
-                             username_bytes)
+        for msg_tuple in _SERVER_MESSAGES:
+            if msg_tuple[0] == msg_type:
+                msg = msg_tuple[1]()
+                msg.ParseFromString(payload)
+                return msg
 
-        packet += self._auth_response(client_flags, username, password,
-                                      database,
-                                      auth_plugin,
-                                      auth_data, ssl_enabled)
+        raise ValueError("Unknown msg_type: {0}".format(msg_type))
 
-        packet += self._connect_with_db(client_flags, database)
+    def write_message(self, msg_id, msg):
+        msg_str = msg.SerializeToString()
+        header = struct.pack("<LB", len(msg_str) + 1, msg_id)
+        self._stream.sendall(b"".join([header, msg_str]))
 
-        if client_flags & ClientFlag.PLUGIN_AUTH:
-            packet += auth_plugin.encode('utf8') + b'\x00'
 
-        return packet
+class Protocol(object):
+    def __init__(self, reader_writer):
+        self._reader = reader_writer
+        self._writer = reader_writer
+        self._message = None
 
-    def make_auth_ssl(self, charset=33, client_flags=0,
-                      max_allowed_packet=1073741824):
-        """Make a SSL authentication packet"""
-        return utils.int4store(client_flags) + \
-               utils.int4store(max_allowed_packet) + \
-               utils.int1store(charset) + \
-               b'\x00' * 23
+    def get_capabilites(self):
+        msg = MySQLxConnection.CapabilitiesGet()
+        self._writer.write_message(
+            MySQLx.ClientMessages.CON_CAPABILITIES_GET, msg)
+        return self._reader.read_message()
 
-    def make_command(self, command, argument=None):
-        """Make a MySQL packet containing a command"""
-        data = utils.int1store(command)
-        if argument is not None:
-            data += argument
-        return data
+    def set_capabilities(self, **kwargs):
+        msg = MySQLxConnection.CapabilitiesSet()
+        for key, value in kwargs.items():
+            value = self._create_any(value)
+            capability = MySQLxConnection.Capability(name=key, value=value)
+            msg.capabilities.capabilities.extend([capability])
 
-    def make_change_user(self, handshake, username=None, password=None,
-                         database=None, charset=33, client_flags=0,
-                         ssl_enabled=False, auth_plugin=None):
-        """Make a MySQL packet with the Change User command"""
+        self._writer.write_message(
+            MySQLx.ClientMessages.CON_CAPABILITIES_SET, msg)
 
-        try:
-            auth_data = handshake['auth_data']
-            auth_plugin = auth_plugin or handshake['auth_plugin']
-        except (TypeError, KeyError) as exc:
-            raise errors.ProgrammingError(
-                "Handshake misses authentication info ({0})".format(exc))
+        return self.read_ok()
 
-        if not username:
-            username = b''
-        try:
-            username_bytes = username.encode('utf8')  # pylint: disable=E1103
-        except AttributeError:
-            # Username is already bytes
-            username_bytes = username
-        packet = struct.pack('<B{usrlen}sx'.format(usrlen=len(username_bytes)),
-                             ServerCmd.CHANGE_USER, username_bytes)
+    def send_auth_start(self, method):
+        msg = MySQLxSession.AuthenticateStart(mech_name=method)
+        self._writer.write_message(
+            MySQLx.ClientMessages.SESS_AUTHENTICATE_START, msg)
 
-        packet += self._auth_response(client_flags, username, password,
-                                      database,
-                                      auth_plugin,
-                                      auth_data, ssl_enabled)
+    def read_auth_continue(self):
+        msg = self._reader.read_message()
+        if not isinstance(msg, MySQLxSession.AuthenticateContinue):
+            raise InterfaceError("Unexpected message encountered during "
+                                 "authentication handshake")
+        return msg.auth_data
 
-        packet += self._connect_with_db(client_flags, database)
+    def send_auth_continue(self, data):
+        msg = MySQLxSession.AuthenticateContinue(
+            auth_data=encode_to_bytes(data))
+        self._writer.write_message(
+            MySQLx.ClientMessages.SESS_AUTHENTICATE_CONTINUE, msg)
 
-        packet += struct.pack('<H', charset)
+    def read_auth_ok(self):
+        while True:
+            msg = self._reader.read_message()
+            if isinstance(msg, MySQLxSession.AuthenticateOk):
+                break
+            if isinstance(msg, MySQLx.Error):
+                raise InterfaceError(msg.msg)
 
-        if client_flags & ClientFlag.PLUGIN_AUTH:
-            packet += auth_plugin.encode('utf8') + b'\x00'
+    def get_binding_scalars(self, statement):
+        count = len(statement._binding_map)
+        scalars = count * [None]
 
-        return packet
+        for binding in statement._bindings:
+            name = binding["name"]
+            if name not in statement._binding_map:
+                raise ProgrammingError("Unable to find placeholder for "
+                                       "parameter: {0}".format(name))
+            pos = statement._binding_map[name]
+            scalars[pos] = self.arg_object_to_scalar(binding["value"],
+                                                     not statement._doc_based)
+        return scalars
 
-    def parse_handshake(self, packet):
-        """Parse a MySQL Handshake-packet"""
-        res = {}
-        res['protocol'] = struct_unpack('<xxxxB', packet[0:5])[0]
-        (packet, res['server_version_original']) = utils.read_string(
-            packet[5:], end=b'\x00')
+    def _apply_filter(self, message, statement):
+        if statement._has_where:
+            message.criteria.CopyFrom(statement._where_expr)
+        if statement._has_bindings:
+            message.args.extend(self.get_binding_scalars(statement))
+        if statement._has_limit:
+            message.limit.row_count = statement._limit_row_count
+            message.limit.offset = statement._limit_offset
+        if statement._has_sort:
+            message.order.extend(statement._sort_expr)
+        if statement._has_group_by:
+            message.grouping.extend(statement._grouping)
+        if statement._has_having:
+            message.grouping_criteria.CopyFrom(statement._having)
 
-        (res['server_threadid'],
-         auth_data1,
-         capabilities1,
-         res['charset'],
-         res['server_status'],
-         capabilities2,
-         auth_data_length
-        ) = struct_unpack('<I8sx2sBH2sBxxxxxxxxxx', packet[0:31])
-        res['server_version_original'] = res['server_version_original'].decode()
+    def send_find(self, stmt):
+        find = MySQLxCrud.Find(
+            data_model=(MySQLxCrud.DOCUMENT
+                        if stmt._doc_based else MySQLxCrud.TABLE),
+            collection=MySQLxCrud.Collection(name=stmt.target.name,
+                                             schema=stmt.schema.name))
+        if stmt._has_projection:
+            find.projection.extend(stmt._projection_expr)
+        self._apply_filter(find, stmt)
+        self._writer.write_message(MySQLx.ClientMessages.CRUD_FIND, find)
 
-        packet = packet[31:]
+    def send_update(self, statement):
+        update = MySQLxCrud.Update(
+            data_model=(MySQLxCrud.DOCUMENT
+                        if statement._doc_based else MySQLxCrud.TABLE),
+            collection=MySQLxCrud.Collection(name=statement.target.name,
+                                             schema=statement.schema.name))
+        self._apply_filter(update, statement)
+        for update_op in statement._update_ops:
+            opexpr = MySQLxCrud.UpdateOperation(
+                operation=update_op.update_type, source=update_op.source)
+            if update_op.value is not None:
+                opexpr.value.CopyFrom(
+                    self.arg_object_to_expr(
+                        update_op.value, not statement._doc_based))
+            update.operation.extend([opexpr])
+        self._writer.write_message(MySQLx.ClientMessages.CRUD_UPDATE, update)
 
-        capabilities = utils.intread(capabilities1 + capabilities2)
-        auth_data2 = b''
-        if capabilities & ClientFlag.SECURE_CONNECTION:
-            size = min(13, auth_data_length - 8) if auth_data_length else 13
-            auth_data2 = packet[0:size]
-            packet = packet[size:]
-            if auth_data2[-1] == 0:
-                auth_data2 = auth_data2[:-1]
+    def send_delete(self, stmt):
+        delete = MySQLxCrud.Delete(
+            data_model=(MySQLxCrud.DOCUMENT
+                        if stmt._doc_based else MySQLxCrud.TABLE),
+            collection=MySQLxCrud.Collection(name=stmt.target.name,
+                                             schema=stmt.schema.name))
+        self._apply_filter(delete, stmt)
+        self._writer.write_message(MySQLx.ClientMessages.CRUD_DELETE, delete)
 
-        if capabilities & ClientFlag.PLUGIN_AUTH:
-            if (b'\x00' not in packet
-                    and res['server_version_original'].startswith("5.5.8")):
-                # MySQL server 5.5.8 has a bug where end byte is not send
-                (packet, res['auth_plugin']) = (b'', packet)
+    def send_execute_statement(self, namespace, stmt, args):
+        stmt = MySQLxSQL.StmtExecute(namespace=namespace,
+                                     stmt=encode_to_bytes(stmt),
+                                     compact_metadata=False)
+        for arg in args:
+            value = self._create_any(arg)
+            stmt.args.extend([value])
+        self._writer.write_message(MySQLx.ClientMessages.SQL_STMT_EXECUTE,
+                                   stmt)
+
+    def send_insert(self, statement):
+        insert = MySQLxCrud.Insert(
+            data_model=(MySQLxCrud.DOCUMENT
+                        if statement._doc_based else MySQLxCrud.TABLE),
+            collection=MySQLxCrud.Collection(name=statement.target.name,
+                                             schema=statement.schema.name))
+        if hasattr(statement, "_fields"):
+            for field in statement._fields:
+                insert.projection.extend([
+                    ExprParser(field, not statement._doc_based)
+                    .parse_table_insert_field()])
+        for value in statement._values:
+            row = MySQLxCrud.Insert.TypedRow()
+            if isinstance(value, list):
+                for val in value:
+                    obj = self.arg_object_to_expr(
+                        val, not statement._doc_based)
+                    row.field.extend([obj])
             else:
-                (packet, res['auth_plugin']) = utils.read_string(
-                    packet, end=b'\x00')
-            res['auth_plugin'] = res['auth_plugin'].decode('utf-8')
-        else:
-            res['auth_plugin'] = 'mysql_native_password'
+                obj = self.arg_object_to_expr(value, not statement._doc_based)
+                row.field.extend([obj])
+            insert.row.extend([row])
+        self._writer.write_message(MySQLx.ClientMessages.CRUD_INSERT, insert)
 
-        res['auth_data'] = auth_data1 + auth_data2
-        res['capabilities'] = capabilities
-        return res
+    def _create_any(self, arg):
+        if isinstance(arg, STRING_TYPES):
+            val = MySQLxDatatypes.Scalar.String(value=encode_to_bytes(arg))
+            scalar = MySQLxDatatypes.Scalar(type=8, v_string=val)
+            return MySQLxDatatypes.Any(type=1, scalar=scalar)
+        elif isinstance(arg, bool):
+            return MySQLxDatatypes.Any(type=1, scalar=build_bool_scalar(arg))
+        elif isinstance(arg, INT_TYPES):
+            return MySQLxDatatypes.Any(type=1, scalar=build_int_scalar(arg))
+        return None
 
-    def parse_ok(self, packet):
-        """Parse a MySQL OK-packet"""
-        if not packet[4] == 0:
-            raise errors.InterfaceError("Failed parsing OK packet (invalid).")
+    def close_result(self, rs):
+        msg = self._read_message(rs)
+        if msg is not None:
+            raise OperationalError("Expected to close the result")
 
-        ok_packet = {}
-        try:
-            ok_packet['field_count'] = struct_unpack('<xxxxB', packet[0:5])[0]
-            (packet, ok_packet['affected_rows']) = utils.read_lc_int(packet[5:])
-            (packet, ok_packet['insert_id']) = utils.read_lc_int(packet)
-            (ok_packet['status_flag'],
-             ok_packet['warning_count']) = struct_unpack('<HH', packet[0:4])
-            packet = packet[4:]
-            if packet:
-                (packet, ok_packet['info_msg']) = utils.read_lc_string(packet)
-                ok_packet['info_msg'] = ok_packet['info_msg'].decode('utf-8')
-        except ValueError:
-            raise errors.InterfaceError("Failed parsing OK packet.")
-        return ok_packet
+    def read_row(self, rs):
+        msg = self._read_message(rs)
+        if msg is None:
+            return None
+        if isinstance(msg, MySQLxResultset.Row):
+            return msg
+        self._reader.push_message(msg)
+        return None
 
-    def parse_column_count(self, packet):
-        """Parse a MySQL packet with the number of columns in result set"""
-        try:
-            count = utils.read_lc_int(packet[4:])[1]
-            if count > MAX_MYSQL_TABLE_COLUMNS:
+    def _process_frame(self, msg, rs):
+        if msg.type == 1:
+            warningMsg = MySQLxNotice.Warning()
+            warningMsg.ParseFromString(msg.payload)
+            rs._warnings.append(Warning(warningMsg.level, warningMsg.code,
+                                        warningMsg.msg))
+        elif msg.type == 2:
+            sessVarMsg = MySQLxNotice.SessionVariableChanged()
+            sessVarMsg.ParseFromString(msg.payload)
+        elif msg.type == 3:
+            sessStateMsg = MySQLxNotice.SessionStateChanged()
+            sessStateMsg.ParseFromString(msg.payload)
+            if sessStateMsg.param == \
+                    MySQLxNotice.SessionStateChanged.ROWS_AFFECTED:
+                rs._rows_affected = sessStateMsg.value.v_unsigned_int
+            elif sessStateMsg.param == \
+                    MySQLxNotice.SessionStateChanged.GENERATED_INSERT_ID:
+                rs._generated_id = sessStateMsg.value.v_unsigned_int
+
+    def _read_message(self, rs):
+        while True:
+            msg = self._reader.read_message()
+            if isinstance(msg, MySQLx.Error):
+                raise OperationalError(msg.msg)
+            elif isinstance(msg, MySQLxNotice.Frame):
+                self._process_frame(msg, rs)
+            elif isinstance(msg, MySQLxSQL.StmtExecuteOk):
                 return None
-            return count
-        except (struct.error, ValueError):
-            raise errors.InterfaceError("Failed parsing column count")
+            elif isinstance(msg, MySQLxResultset.FetchDone):
+                rs._closed = True
+            elif isinstance(msg, MySQLxResultset.FetchDoneMoreResultsets):
+                rs._has_more_results = True
+            else:
+                break
+        return msg
 
-    def parse_column(self, packet, charset='utf-8'):
-        """Parse a MySQL column-packet"""
-        (packet, _) = utils.read_lc_string(packet[4:])  # catalog
-        (packet, _) = utils.read_lc_string(packet)  # db
-        (packet, _) = utils.read_lc_string(packet)  # table
-        (packet, _) = utils.read_lc_string(packet)  # org_table
-        (packet, name) = utils.read_lc_string(packet)  # name
-        (packet, _) = utils.read_lc_string(packet)  # org_name
-
-        try:
-            (_, _, field_type,
-             flags, _) = struct_unpack('<xHIBHBxx', packet)
-        except struct.error:
-            raise errors.InterfaceError("Failed parsing column information")
-
-        return (
-            name.decode(charset),
-            field_type,
-            None,  # display_size
-            None,  # internal_size
-            None,  # precision
-            None,  # scale
-            ~flags & FieldFlag.NOT_NULL,  # null_ok
-            flags,  # MySQL specific
-        )
-
-    def parse_eof(self, packet):
-        """Parse a MySQL EOF-packet"""
-        if packet[4] == 0:
-            # EOF packet deprecation
-            return self.parse_ok(packet)
-
-        err_msg = "Failed parsing EOF packet."
-        res = {}
-        try:
-            unpacked = struct_unpack('<xxxBBHH', packet)
-        except struct.error:
-            raise errors.InterfaceError(err_msg)
-
-        if not (unpacked[1] == 254 and len(packet) <= 9):
-            raise errors.InterfaceError(err_msg)
-
-        res['warning_count'] = unpacked[2]
-        res['status_flag'] = unpacked[3]
-        return res
-
-    def parse_statistics(self, packet, with_header=True):
-        """Parse the statistics packet"""
-        errmsg = "Failed getting COM_STATISTICS information"
-        res = {}
-        # Information is separated by 2 spaces
-        if with_header:
-            pairs = packet[4:].split(b'\x20\x20')
-        else:
-            pairs = packet.split(b'\x20\x20')
-        for pair in pairs:
-            try:
-                (lbl, val) = [v.strip() for v in pair.split(b':', 2)]
-            except:
-                raise errors.InterfaceError(errmsg)
-
-            # It's either an integer or a decimal
-            lbl = lbl.decode('utf-8')
-            try:
-                res[lbl] = int(val)
-            except:
-                try:
-                    res[lbl] = Decimal(val.decode('utf-8'))
-                except:
-                    raise errors.InterfaceError(
-                        "{0} ({1}:{2}).".format(errmsg, lbl, val))
-        return res
-
-    def read_text_result(self, sock, version, count=1):
-        """Read MySQL text result
-
-        Reads all or given number of rows from the socket.
-
-        Returns a tuple with 2 elements: a list with all rows and
-        the EOF packet.
-        """
-        rows = []
-        eof = None
-        rowdata = None
-        i = 0
-        eof57 = version >= (5, 7, 5)
+    def get_column_metadata(self, rs):
+        columns = []
         while True:
-            if eof or i == count:
+            msg = self._read_message(rs)
+            if msg is None:
                 break
-            packet = sock.recv()
-            if packet.startswith(b'\xff\xff\xff'):
-                datas = [packet[4:]]
-                packet = sock.recv()
-                while packet.startswith(b'\xff\xff\xff'):
-                    datas.append(packet[4:])
-                    packet = sock.recv()
-                datas.append(packet[4:])
-                rowdata = utils.read_lc_string_list(bytearray(b'').join(datas))
-            elif (packet[4] == 254 and packet[0] < 7):
-                eof = self.parse_eof(packet)
-                rowdata = None
-            elif eof57 and (packet[4] == 0 and packet[0] > 9):
-                # EOF deprecation: make sure we catch it whether flag is set or not
-                eof = self.parse_ok(packet)
-                rowdata = None
-            else:
-                eof = None
-                rowdata = utils.read_lc_string_list(packet[4:])
-            if eof is None and rowdata is not None:
-                rows.append(rowdata)
-            elif eof is None and rowdata is None:
-                raise get_exception(packet)
-            i += 1
-        return rows, eof
-
-    def _parse_binary_integer(self, packet, field):
-        """Parse an integer from a binary packet"""
-        if field[1] == FieldType.TINY:
-            format_ = 'b'
-            length = 1
-        elif field[1] == FieldType.SHORT:
-            format_ = 'h'
-            length = 2
-        elif field[1] in (FieldType.INT24, FieldType.LONG):
-            format_ = 'i'
-            length = 4
-        elif field[1] == FieldType.LONGLONG:
-            format_ = 'q'
-            length = 8
-
-        if field[7] & FieldFlag.UNSIGNED:
-            format_ = format_.upper()
-
-        return (packet[length:], struct_unpack(format_, packet[0:length])[0])
-
-    def _parse_binary_float(self, packet, field):
-        """Parse a float/double from a binary packet"""
-        if field[1] == FieldType.DOUBLE:
-            length = 8
-            format_ = 'd'
-        else:
-            length = 4
-            format_ = 'f'
-
-        return (packet[length:], struct_unpack(format_, packet[0:length])[0])
-
-    def _parse_binary_timestamp(self, packet, field):
-        """Parse a timestamp from a binary packet"""
-        length = packet[0]
-        value = None
-        if length == 4:
-            value = datetime.date(
-                year=struct_unpack('H', packet[1:3])[0],
-                month=packet[3],
-                day=packet[4])
-        elif length >= 7:
-            mcs = 0
-            if length == 11:
-                mcs = struct_unpack('I', packet[8:length + 1])[0]
-            value = datetime.datetime(
-                year=struct_unpack('H', packet[1:3])[0],
-                month=packet[3],
-                day=packet[4],
-                hour=packet[5],
-                minute=packet[6],
-                second=packet[7],
-                microsecond=mcs)
-
-        return (packet[length + 1:], value)
-
-    def _parse_binary_time(self, packet, field):
-        """Parse a time value from a binary packet"""
-        length = packet[0]
-        data = packet[1:length + 1]
-        mcs = 0
-        if length > 8:
-            mcs = struct_unpack('I', data[8:])[0]
-        days = struct_unpack('I', data[1:5])[0]
-        if data[0] == 1:
-            days *= -1
-        tmp = datetime.timedelta(days=days,
-                                 seconds=data[7],
-                                 microseconds=mcs,
-                                 minutes=data[6],
-                                 hours=data[5])
-
-        return (packet[length + 1:], tmp)
-
-    def _parse_binary_values(self, fields, packet):
-        """Parse values from a binary result packet"""
-        null_bitmap_length = (len(fields) + 7 + 2) // 8
-        null_bitmap = [int(i) for i in packet[0:null_bitmap_length]]
-        packet = packet[null_bitmap_length:]
-
-        values = []
-        for pos, field in enumerate(fields):
-            if null_bitmap[int((pos+2)/8)] & (1 << (pos + 2) % 8):
-                values.append(None)
-                continue
-            elif field[1] in (FieldType.TINY, FieldType.SHORT,
-                              FieldType.INT24,
-                              FieldType.LONG, FieldType.LONGLONG):
-                (packet, value) = self._parse_binary_integer(packet, field)
-                values.append(value)
-            elif field[1] in (FieldType.DOUBLE, FieldType.FLOAT):
-                (packet, value) = self._parse_binary_float(packet, field)
-                values.append(value)
-            elif field[1] in (FieldType.DATETIME, FieldType.DATE,
-                              FieldType.TIMESTAMP):
-                (packet, value) = self._parse_binary_timestamp(packet, field)
-                values.append(value)
-            elif field[1] == FieldType.TIME:
-                (packet, value) = self._parse_binary_time(packet, field)
-                values.append(value)
-            else:
-                (packet, value) = utils.read_lc_string(packet)
-                values.append(value)
-
-        return tuple(values)
-
-    def read_binary_result(self, sock, columns, count=1):
-        """Read MySQL binary protocol result
-
-        Reads all or given number of binary resultset rows from the socket.
-        """
-        rows = []
-        eof = None
-        values = None
-        i = 0
-        while True:
-            if eof is not None:
+            if isinstance(msg, MySQLxResultset.Row):
+                self._reader.push_message(msg)
                 break
-            if i == count:
-                break
-            packet = sock.recv()
-            if packet[4] == 254:
-                eof = self.parse_eof(packet)
-                values = None
-            elif packet[4] == 0:
-                eof = None
-                values = self._parse_binary_values(columns, packet[5:])
-            if eof is None and values is not None:
-                rows.append(values)
-            elif eof is None and values is None:
-                raise get_exception(packet)
-            i += 1
-        return (rows, eof)
+            if not isinstance(msg, MySQLxResultset.ColumnMetaData):
+                raise InterfaceError("Unexpected msg type")
+            col = ColumnMetaData(msg.type, msg.catalog, msg.schema, msg.table,
+                                 msg.original_table, msg.name,
+                                 msg.original_name, msg.length, msg.collation,
+                                 msg.fractional_digits, msg.flags,
+                                 msg.content_type)
+            columns.append(col)
+        return columns
 
-    def parse_binary_prepare_ok(self, packet):
-        """Parse a MySQL Binary Protocol OK packet"""
-        if not packet[4] == 0:
-            raise errors.InterfaceError("Failed parsing Binary OK packet")
+    def arg_object_to_expr(self, value, allow_relational):
+        if value is None:
+            return MySQLxExpr.Expr(type=MySQLxExpr.Expr.LITERAL,
+                                   literal=build_null_scalar())
+        if isinstance(value, bool):
+            return MySQLxExpr.Expr(type=MySQLxExpr.Expr.LITERAL,
+                                   literal=build_bool_scalar(value))
+        elif isinstance(value, INT_TYPES):
+            return MySQLxExpr.Expr(type=MySQLxExpr.Expr.LITERAL,
+                                   literal=build_int_scalar(value))
+        elif isinstance(value, (float)):
+            return MySQLxExpr.Expr(type=MySQLxExpr.Expr.LITERAL,
+                                   literal=build_double_scalar(value))
+        elif isinstance(value, STRING_TYPES):
+            try:
+                expression = ExprParser(value, allow_relational).expr()
+                if expression.has_identifier():
+                    return MySQLxExpr.Expr(type=MySQLxExpr.Expr.LITERAL,
+                                           literal=build_string_scalar(value))
+                return expression
+            except:
+                return MySQLxExpr.Expr(type=MySQLxExpr.Expr.LITERAL,
+                                       literal=build_string_scalar(value))
+        elif isinstance(value, DbDoc):
+            return MySQLxExpr.Expr(type=MySQLxExpr.Expr.LITERAL,
+                                   literal=build_string_scalar(str(value)))
+        raise InterfaceError("Unsupported type: {0}".format(type(value)))
 
-        ok_pkt = {}
-        try:
-            (packet, ok_pkt['statement_id']) = utils.read_int(packet[5:], 4)
-            (packet, ok_pkt['num_columns']) = utils.read_int(packet, 2)
-            (packet, ok_pkt['num_params']) = utils.read_int(packet, 2)
-            packet = packet[1:]  # Filler 1 * \x00
-            (packet, ok_pkt['warning_count']) = utils.read_int(packet, 2)
-        except ValueError:
-            raise errors.InterfaceError("Failed parsing Binary OK packet")
+    def arg_object_to_scalar(self, value, allow_relational):
+        return self.arg_object_to_expr(value, allow_relational).literal
 
-        return ok_pkt
+    def read_ok(self):
+        msg = self._reader.read_message()
+        if isinstance(msg, MySQLx.Error):
+            raise InterfaceError(msg.msg)
 
-    def _prepare_binary_integer(self, value):
-        """Prepare an integer for the MySQL binary protocol"""
-        field_type = None
-        flags = 0
-        if value < 0:
-            if value >= -128:
-                format_ = 'b'
-                field_type = FieldType.TINY
-            elif value >= -32768:
-                format_ = 'h'
-                field_type = FieldType.SHORT
-            elif value >= -2147483648:
-                format_ = 'i'
-                field_type = FieldType.LONG
-            else:
-                format_ = 'q'
-                field_type = FieldType.LONGLONG
-        else:
-            flags = 128
-            if value <= 255:
-                format_ = 'B'
-                field_type = FieldType.TINY
-            elif value <= 65535:
-                format_ = 'H'
-                field_type = FieldType.SHORT
-            elif value <= 4294967295:
-                format_ = 'I'
-                field_type = FieldType.LONG
-            else:
-                field_type = FieldType.LONGLONG
-                format_ = 'Q'
-        return (struct.pack(format_, value), field_type, flags)
+        if not isinstance(msg, MySQLx.Ok):
+            raise InterfaceError("Unexpected message encountered")
 
-    def _prepare_binary_timestamp(self, value):
-        """Prepare a timestamp object for the MySQL binary protocol
-
-        This method prepares a timestamp of type datetime.datetime or
-        datetime.date for sending over the MySQL binary protocol.
-        A tuple is returned with the prepared value and field type
-        as elements.
-
-        Raises ValueError when the argument value is of invalid type.
-
-        Returns a tuple.
-        """
-        if isinstance(value, datetime.datetime):
-            field_type = FieldType.DATETIME
-        elif isinstance(value, datetime.date):
-            field_type = FieldType.DATE
-        else:
-            raise ValueError(
-                "Argument must a datetime.datetime or datetime.date")
-
-        packed = (utils.int2store(value.year) +
-                  utils.int1store(value.month) +
-                  utils.int1store(value.day))
-
-        if isinstance(value, datetime.datetime):
-            packed = (packed + utils.int1store(value.hour) +
-                      utils.int1store(value.minute) +
-                      utils.int1store(value.second))
-            if value.microsecond > 0:
-                packed += utils.int4store(value.microsecond)
-
-        packed = utils.int1store(len(packed)) + packed
-        return (packed, field_type)
-
-    def _prepare_binary_time(self, value):
-        """Prepare a time object for the MySQL binary protocol
-
-        This method prepares a time object of type datetime.timedelta or
-        datetime.time for sending over the MySQL binary protocol.
-        A tuple is returned with the prepared value and field type
-        as elements.
-
-        Raises ValueError when the argument value is of invalid type.
-
-        Returns a tuple.
-        """
-        if not isinstance(value, (datetime.timedelta, datetime.time)):
-            raise ValueError(
-                "Argument must a datetime.timedelta or datetime.time")
-
-        field_type = FieldType.TIME
-        negative = 0
-        mcs = None
-        packed = b''
-
-        if isinstance(value, datetime.timedelta):
-            if value.days < 0:
-                negative = 1
-            (hours, remainder) = divmod(value.seconds, 3600)
-            (mins, secs) = divmod(remainder, 60)
-            packed += (utils.int4store(abs(value.days)) +
-                       utils.int1store(hours) +
-                       utils.int1store(mins) +
-                       utils.int1store(secs))
-            mcs = value.microseconds
-        else:
-            packed += (utils.int4store(0) +
-                       utils.int1store(value.hour) +
-                       utils.int1store(value.minute) +
-                       utils.int1store(value.second))
-            mcs = value.microsecond
-        if mcs:
-            packed += utils.int4store(mcs)
-
-        packed = utils.int1store(negative) + packed
-        packed = utils.int1store(len(packed)) + packed
-
-        return (packed, field_type)
-
-    def _prepare_stmt_send_long_data(self, statement, param, data):
-        """Prepare long data for prepared statements
-
-        Returns a string.
-        """
-        packet = (
-            utils.int4store(statement) +
-            utils.int2store(param) +
-            data)
-        return packet
-
-    def make_stmt_execute(self, statement_id, data=(), parameters=(),
-                          flags=0, long_data_used=None, charset='utf8'):
-        """Make a MySQL packet with the Statement Execute command"""
-        iteration_count = 1
-        null_bitmap = [0] * ((len(data) + 7) // 8)
-        values = []
-        types = []
-        packed = b''
-        if long_data_used is None:
-            long_data_used = {}
-        if parameters and data:
-            if len(data) != len(parameters):
-                raise errors.InterfaceError(
-                    "Failed executing prepared statement: data values does not"
-                    " match number of parameters")
-            for pos, _ in enumerate(parameters):
-                value = data[pos]
-                flags = 0
-                if value is None:
-                    null_bitmap[(pos // 8)] |= 1 << (pos % 8)
-                    types.append(utils.int1store(FieldType.NULL) +
-                                 utils.int1store(flags))
-                    continue
-                elif pos in long_data_used:
-                    if long_data_used[pos][0]:
-                        # We suppose binary data
-                        field_type = FieldType.BLOB
-                    else:
-                        # We suppose text data
-                        field_type = FieldType.STRING
-                elif isinstance(value, int):
-                    (packed, field_type,
-                     flags) = self._prepare_binary_integer(value)
-                    values.append(packed)
-                elif isinstance(value, str):
-                    if PY2:
-                        values.append(utils.lc_int(len(value)) +
-                                      value)
-                    else:
-                        value = value.encode(charset)
-                        values.append(
-                            utils.lc_int(len(value)) + value)
-                    field_type = FieldType.VARCHAR
-                elif isinstance(value, bytes):
-                    values.append(utils.lc_int(len(value)) + value)
-                    field_type = FieldType.BLOB
-                elif PY2 and \
-                        isinstance(value, unicode):  # pylint: disable=E0602
-                    value = value.encode(charset)
-                    values.append(utils.lc_int(len(value)) + value)
-                    field_type = FieldType.VARCHAR
-                elif isinstance(value, Decimal):
-                    values.append(
-                        utils.lc_int(len(str(value).encode(
-                            charset))) + str(value).encode(charset))
-                    field_type = FieldType.DECIMAL
-                elif isinstance(value, float):
-                    values.append(struct.pack('d', value))
-                    field_type = FieldType.DOUBLE
-                elif isinstance(value, (datetime.datetime, datetime.date)):
-                    (packed, field_type) = self._prepare_binary_timestamp(
-                        value)
-                    values.append(packed)
-                elif isinstance(value, (datetime.timedelta, datetime.time)):
-                    (packed, field_type) = self._prepare_binary_time(value)
-                    values.append(packed)
-                else:
-                    raise errors.ProgrammingError(
-                        "MySQL binary protocol can not handle "
-                        "'{classname}' objects".format(
-                            classname=value.__class__.__name__))
-                types.append(utils.int1store(field_type) +
-                             utils.int1store(flags))
-
-        packet = (
-            utils.int4store(statement_id) +
-            utils.int1store(flags) +
-            utils.int4store(iteration_count) +
-            b''.join([struct.pack('B', bit) for bit in null_bitmap]) +
-            utils.int1store(1)
-        )
-
-        for a_type in types:
-            packet += a_type
-
-        for a_value in values:
-            packet += a_value
-
-        return packet
-
-    def parse_auth_switch_request(self, packet):
-        """Parse a MySQL AuthSwitchRequest-packet"""
-        if not packet[4] == 254:
-            raise errors.InterfaceError(
-                "Failed parsing AuthSwitchRequest packet")
-
-        (packet, plugin_name) = utils.read_string(packet[5:], end=b'\x00')
-        if packet and packet[-1] == 0:
-            packet = packet[:-1]
-
-        return plugin_name.decode('utf8'), packet
-
-    def parse_auth_more_data(self, packet):
-        """Parse a MySQL AuthMoreData-packet"""
-        if not packet[4] == 1:
-            raise errors.InterfaceError(
-                "Failed parsing AuthMoreData packet")
-
-        return packet[5:]
+    def send_close(self):
+        msg = MySQLxSession.Close()
+        self._writer.write_message(MySQLx.ClientMessages.SESS_CLOSE, msg)
