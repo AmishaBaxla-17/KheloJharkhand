@@ -1,110 +1,111 @@
 Metadata-Version: 2.1
-Name: captcha
-Version: 0.4
-Summary: A captcha library that generates audio and image CAPTCHAs.
-Home-page: https://github.com/lepture/captcha
-Author: Hsiaoming Yang
-Author-email: me@lepture.com
-License: BSD
+Name: click
+Version: 8.0.3
+Summary: Composable command line interface toolkit
+Home-page: https://palletsprojects.com/p/click/
+Author: Armin Ronacher
+Author-email: armin.ronacher@active-4.com
+Maintainer: Pallets
+Maintainer-email: contact@palletsprojects.com
+License: BSD-3-Clause
+Project-URL: Donate, https://palletsprojects.com/donate
+Project-URL: Documentation, https://click.palletsprojects.com/
+Project-URL: Changes, https://click.palletsprojects.com/changes/
+Project-URL: Source Code, https://github.com/pallets/click/
+Project-URL: Issue Tracker, https://github.com/pallets/click/issues/
+Project-URL: Twitter, https://twitter.com/PalletsTeam
+Project-URL: Chat, https://discord.gg/pallets
 Platform: UNKNOWN
-Classifier: Development Status :: 4 - Beta
-Classifier: Environment :: Console
+Classifier: Development Status :: 5 - Production/Stable
 Classifier: Intended Audience :: Developers
-Classifier: License :: OSI Approved
 Classifier: License :: OSI Approved :: BSD License
-Classifier: Operating System :: MacOS
-Classifier: Operating System :: POSIX
-Classifier: Operating System :: POSIX :: Linux
+Classifier: Operating System :: OS Independent
 Classifier: Programming Language :: Python
-Classifier: Programming Language :: Python :: 2
-Classifier: Programming Language :: Python :: 2.7
-Classifier: Programming Language :: Python :: 3
-Classifier: Programming Language :: Python :: 3.4
-Classifier: Programming Language :: Python :: 3.5
-Classifier: Programming Language :: Python :: 3.6
-Classifier: Programming Language :: Python :: 3.6
-Classifier: Programming Language :: Python :: Implementation
-Classifier: Programming Language :: Python :: Implementation :: CPython
-Classifier: Programming Language :: Python :: Implementation :: PyPy
-Requires-Dist: Pillow
+Requires-Python: >=3.6
+Description-Content-Type: text/x-rst
+License-File: LICENSE.rst
+Requires-Dist: colorama ; platform_system == "Windows"
+Requires-Dist: importlib-metadata ; python_version < "3.8"
 
-Captcha
-=======
+\$ click\_
+==========
 
-A captcha library that generates audio and image CAPTCHAs.
+Click is a Python package for creating beautiful command line interfaces
+in a composable way with as little code as necessary. It's the "Command
+Line Interface Creation Kit". It's highly configurable but comes with
+sensible defaults out of the box.
 
-.. image:: https://img.shields.io/badge/donate-lepture-ff69b4.svg
-   :target: https://lepture.com/donate
-   :alt: Donate lepture
-.. image:: https://img.shields.io/badge/I0-patreon-f96854.svg
-   :target: https://patreon.com/lepture
-   :alt: Become a Patreon
-.. image:: https://travis-ci.org/lepture/captcha.svg?branch=master
-   :target: https://travis-ci.org/lepture/captcha
-.. image:: https://ci.appveyor.com/api/projects/status/amm21f13lx4wuura?svg=true
-   :target: https://ci.appveyor.com/project/lepture/captcha
-.. image:: https://coveralls.io/repos/lepture/captcha/badge.svg?branch=master
-   :target: https://coveralls.io/r/lepture/captcha
+It aims to make the process of writing command line tools quick and fun
+while also preventing any frustration caused by the inability to
+implement an intended CLI API.
 
-Features
---------
+Click in three points:
 
-1. Audio CAPTCHAs `DEMO <https://github.com/lepture/captcha/releases/download/v0.1-beta/out.wav>`_
-2. Image CAPTCHAs
-
-.. image:: https://cloud.githubusercontent.com/assets/290496/5213632/95e68768-764b-11e4-862f-d95a8f776cdd.png
+-   Arbitrary nesting of commands
+-   Automatic help page generation
+-   Supports lazy loading of subcommands at runtime
 
 
-Installation
-------------
+Installing
+----------
 
-Install captcha with pip::
+Install and update using `pip`_:
 
-    $ pip install captcha
+.. code-block:: text
 
-Usage
------
+    $ pip install -U click
 
-Audio and Image CAPTCHAs are in separated modules:
+.. _pip: https://pip.pypa.io/en/stable/getting-started/
 
-.. code:: python
 
-    from captcha.audio import AudioCaptcha
-    from captcha.image import ImageCaptcha
+A Simple Example
+----------------
 
-    audio = AudioCaptcha(voicedir='/path/to/voices')
-    image = ImageCaptcha(fonts=['/path/A.ttf', '/path/B.ttf'])
+.. code-block:: python
 
-    data = audio.generate('1234')
-    audio.write('1234', 'out.wav')
+    import click
 
-    data = image.generate('1234')
-    image.write('1234', 'out.png')
+    @click.command()
+    @click.option("--count", default=1, help="Number of greetings.")
+    @click.option("--name", prompt="Your name", help="The person to greet.")
+    def hello(count, name):
+        """Simple program that greets NAME for a total of COUNT times."""
+        for _ in range(count):
+            click.echo(f"Hello, {name}!")
 
-This is the APIs for your daily works. We do have built-in voice data and font
-data. But it is suggested that you use your own voice and font data.
+    if __name__ == '__main__':
+        hello()
 
-Voices
+.. code-block:: text
+
+    $ python hello.py --count=3
+    Your name: Click
+    Hello, Click!
+    Hello, Click!
+    Hello, Click!
+
+
+Donate
 ------
 
-We can build our customized voice library with the help of espeak and ffmpeg::
+The Pallets organization develops and supports Click and other popular
+packages. In order to grow the community of contributors and users, and
+allow the maintainers to devote more time to the projects, `please
+donate today`_.
 
-   export ESLANG=en
-
-   mkdir $ESLANG
-
-   for i in {a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z,0,1,2,3,4,5,6,7,8,9}; do mkdir $ESLANG/$i; espeak -a 150 -s 100 -p 15 -v$ESLANG $i -w $ESLANG/$i/orig_default.wav; ffmpeg -i $ESLANG/$i/orig_default.wav -ar 8000 -ac 1 -acodec pcm_u8 $ESLANG/$i/default.wav; rm $ESLANG/$i/orig_default.wav; done
+.. _please donate today: https://palletsprojects.com/donate
 
 
-Contribution
-------------
+Links
+-----
 
-We need voice wav files. The voice wav file should be in 8-bit, please keep it
-as small as possible. Name your voice file as::
-
-    {{language}}-{{character}}-{{username}}.wav
-    # example: zh-1-lepture.wav
-
-TODO: we need a place to upload voice files.
+-   Documentation: https://click.palletsprojects.com/
+-   Changes: https://click.palletsprojects.com/changes/
+-   PyPI Releases: https://pypi.org/project/click/
+-   Source Code: https://github.com/pallets/click
+-   Issue Tracker: https://github.com/pallets/click/issues
+-   Website: https://palletsprojects.com/p/click
+-   Twitter: https://twitter.com/PalletsTeam
+-   Chat: https://discord.gg/pallets
 
 
