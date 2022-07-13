@@ -1,127 +1,320 @@
-# MySQL Connector/Python - MySQL driver written in Python.
+import collections
+import os
+import sys
+import warnings
 
-# New file added for Django 1.8
+import PIL
 
-import django
-if django.VERSION >= (1, 8):
-    from django.db.backends.base.features import BaseDatabaseFeatures
-else:
-    from django.db.backends import BaseDatabaseFeatures
-from django.utils.functional import cached_property
-from django.utils import six
+from . import Image
 
-try:
-    import pytz
-    HAVE_PYTZ = True
-except ImportError:
-    HAVE_PYTZ = False
+modules = {
+    "pil": ("PIL._imaging", "PILLOW_VERSION"),
+    "tkinter": ("PIL._tkinter_finder", "tk_version"),
+    "freetype2": ("PIL._imagingft", "freetype2_version"),
+    "littlecms2": ("PIL._imagingcms", "littlecms_version"),
+    "webp": ("PIL._webp", "webpdecoder_version"),
+}
 
 
-class DatabaseFeatures(BaseDatabaseFeatures):
-    """Features specific to MySQL
-
-    Microsecond precision is supported since MySQL 5.6.3 and turned on
-    by default if this MySQL version is used.
+def check_module(feature):
     """
-    empty_fetchmany_value = []
-    update_can_self_select = False
-    allows_group_by_pk = True
-    related_fields_match_type = True
-    allow_sliced_subqueries = False
-    has_bulk_insert = True
-    has_select_for_update = True
-    has_select_for_update_nowait = False
-    supports_forward_references = False
-    supports_regex_backreferencing = False
-    supports_date_lookup_using_string = False
-    can_introspect_autofield = True
-    can_introspect_binary_field = False
-    can_introspect_small_integer_field = True
-    supports_timezones = False
-    requires_explicit_null_ordering_when_grouping = True
-    allows_auto_pk_0 = False
-    allows_primary_key_0 = False
-    uses_savepoints = True
-    atomic_transactions = False
-    supports_column_check_constraints = False
+    Checks if a module is available.
 
-    if django.VERSION < (1, 8):
-        supports_long_model_names = False
-        supports_binary_field = six.PY2
-        can_introspect_boolean_field = False
+    :param feature: The module to check for.
+    :returns: ``True`` if available, ``False`` otherwise.
+    :raises ValueError: If the module is not defined in this version of Pillow.
+    """
+    if not (feature in modules):
+        raise ValueError(f"Unknown module {feature}")
 
-    def __init__(self, connection):
-        super(DatabaseFeatures, self).__init__(connection)
+    module, ver = modules[feature]
 
-    @cached_property
-    def supports_microsecond_precision(self):
-        if self.connection.mysql_version >= (5, 6, 3):
-            return True
+    try:
+        __import__(module)
+        return True
+    except ImportError:
         return False
 
-    @cached_property
-    def mysql_storage_engine(self):
-        """Get default storage engine of MySQL
 
-        This method creates a table without ENGINE table option and inspects
-        which engine was used.
+def version_module(feature):
+    """
+    :param feature: The module to check for.
+    :returns:
+        The loaded version number as a string, or ``None`` if unknown or not available.
+    :raises ValueError: If the module is not defined in this version of Pillow.
+    """
+    if not check_module(feature):
+        return None
 
-        Used by Django tests.
-        """
-        tblname = 'INTROSPECT_TEST'
+    module, ver = modules[feature]
 
-        droptable = 'DROP TABLE IF EXISTS {table}'.format(table=tblname)
-        with self.connection.cursor() as cursor:
-            cursor.execute(droptable)
-            cursor.execute('CREATE TABLE {table} (X INT)'.format(table=tblname))
+    if ver is None:
+        return None
 
-            if self.connection.mysql_version >= (5, 0, 0):
-                cursor.execute(
-                    "SELECT ENGINE FROM INFORMATION_SCHEMA.TABLES "
-                    "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
-                    (self.connection.settings_dict['NAME'], tblname))
-                engine = cursor.fetchone()[0]
+    return getattr(__import__(module, fromlist=[ver]), ver)
+
+
+def get_supported_modules():
+    """
+    :returns: A list of all supported modules.
+    """
+    return [f for f in modules if check_module(f)]
+
+
+codecs = {
+    "jpg": ("jpeg", "jpeglib"),
+    "jpg_2000": ("jpeg2k", "jp2klib"),
+    "zlib": ("zip", "zlib"),
+    "libtiff": ("libtiff", "libtiff"),
+}
+
+
+def check_codec(feature):
+    """
+    Checks if a codec is available.
+
+    :param feature: The codec to check for.
+    :returns: ``True`` if available, ``False`` otherwise.
+    :raises ValueError: If the codec is not defined in this version of Pillow.
+    """
+    if feature not in codecs:
+        raise ValueError(f"Unknown codec {feature}")
+
+    codec, lib = codecs[feature]
+
+    return codec + "_encoder" in dir(Image.core)
+
+
+def version_codec(feature):
+    """
+    :param feature: The codec to check for.
+    :returns:
+        The version number as a string, or ``None`` if not available.
+        Checked at compile time for ``jpg``, run-time otherwise.
+    :raises ValueError: If the codec is not defined in this version of Pillow.
+    """
+    if not check_codec(feature):
+        return None
+
+    codec, lib = codecs[feature]
+
+    version = getattr(Image.core, lib + "_version")
+
+    if feature == "libtiff":
+        return version.split("\n")[0].split("Version ")[1]
+
+    return version
+
+
+def get_supported_codecs():
+    """
+    :returns: A list of all supported codecs.
+    """
+    return [f for f in codecs if check_codec(f)]
+
+
+features = {
+    "webp_anim": ("PIL._webp", "HAVE_WEBPANIM", None),
+    "webp_mux": ("PIL._webp", "HAVE_WEBPMUX", None),
+    "transp_webp": ("PIL._webp", "HAVE_TRANSPARENCY", None),
+    "raqm": ("PIL._imagingft", "HAVE_RAQM", "raqm_version"),
+    "fribidi": ("PIL._imagingft", "HAVE_FRIBIDI", "fribidi_version"),
+    "harfbuzz": ("PIL._imagingft", "HAVE_HARFBUZZ", "harfbuzz_version"),
+    "libjpeg_turbo": ("PIL._imaging", "HAVE_LIBJPEGTURBO", "libjpeg_turbo_version"),
+    "libimagequant": ("PIL._imaging", "HAVE_LIBIMAGEQUANT", "imagequant_version"),
+    "xcb": ("PIL._imaging", "HAVE_XCB", None),
+}
+
+
+def check_feature(feature):
+    """
+    Checks if a feature is available.
+
+    :param feature: The feature to check for.
+    :returns: ``True`` if available, ``False`` if unavailable, ``None`` if unknown.
+    :raises ValueError: If the feature is not defined in this version of Pillow.
+    """
+    if feature not in features:
+        raise ValueError(f"Unknown feature {feature}")
+
+    module, flag, ver = features[feature]
+
+    try:
+        imported_module = __import__(module, fromlist=["PIL"])
+        return getattr(imported_module, flag)
+    except ImportError:
+        return None
+
+
+def version_feature(feature):
+    """
+    :param feature: The feature to check for.
+    :returns: The version number as a string, or ``None`` if not available.
+    :raises ValueError: If the feature is not defined in this version of Pillow.
+    """
+    if not check_feature(feature):
+        return None
+
+    module, flag, ver = features[feature]
+
+    if ver is None:
+        return None
+
+    return getattr(__import__(module, fromlist=[ver]), ver)
+
+
+def get_supported_features():
+    """
+    :returns: A list of all supported features.
+    """
+    return [f for f in features if check_feature(f)]
+
+
+def check(feature):
+    """
+    :param feature: A module, codec, or feature name.
+    :returns:
+        ``True`` if the module, codec, or feature is available,
+        ``False`` or ``None`` otherwise.
+    """
+
+    if feature in modules:
+        return check_module(feature)
+    if feature in codecs:
+        return check_codec(feature)
+    if feature in features:
+        return check_feature(feature)
+    warnings.warn(f"Unknown feature '{feature}'.", stacklevel=2)
+    return False
+
+
+def version(feature):
+    """
+    :param feature:
+        The module, codec, or feature to check for.
+    :returns:
+        The version number as a string, or ``None`` if unknown or not available.
+    """
+    if feature in modules:
+        return version_module(feature)
+    if feature in codecs:
+        return version_codec(feature)
+    if feature in features:
+        return version_feature(feature)
+    return None
+
+
+def get_supported():
+    """
+    :returns: A list of all supported modules, features, and codecs.
+    """
+
+    ret = get_supported_modules()
+    ret.extend(get_supported_features())
+    ret.extend(get_supported_codecs())
+    return ret
+
+
+def pilinfo(out=None, supported_formats=True):
+    """
+    Prints information about this installation of Pillow.
+    This function can be called with ``python3 -m PIL``.
+
+    :param out:
+        The output stream to print to. Defaults to ``sys.stdout`` if ``None``.
+    :param supported_formats:
+        If ``True``, a list of all supported image file formats will be printed.
+    """
+
+    if out is None:
+        out = sys.stdout
+
+    Image.init()
+
+    print("-" * 68, file=out)
+    print(f"Pillow {PIL.__version__}", file=out)
+    py_version = sys.version.splitlines()
+    print(f"Python {py_version[0].strip()}", file=out)
+    for py_version in py_version[1:]:
+        print(f"       {py_version.strip()}", file=out)
+    print("-" * 68, file=out)
+    print(
+        f"Python modules loaded from {os.path.dirname(Image.__file__)}",
+        file=out,
+    )
+    print(
+        f"Binary modules loaded from {os.path.dirname(Image.core.__file__)}",
+        file=out,
+    )
+    print("-" * 68, file=out)
+
+    for name, feature in [
+        ("pil", "PIL CORE"),
+        ("tkinter", "TKINTER"),
+        ("freetype2", "FREETYPE2"),
+        ("littlecms2", "LITTLECMS2"),
+        ("webp", "WEBP"),
+        ("transp_webp", "WEBP Transparency"),
+        ("webp_mux", "WEBPMUX"),
+        ("webp_anim", "WEBP Animation"),
+        ("jpg", "JPEG"),
+        ("jpg_2000", "OPENJPEG (JPEG2000)"),
+        ("zlib", "ZLIB (PNG/ZIP)"),
+        ("libtiff", "LIBTIFF"),
+        ("raqm", "RAQM (Bidirectional Text)"),
+        ("libimagequant", "LIBIMAGEQUANT (Quantization method)"),
+        ("xcb", "XCB (X protocol)"),
+    ]:
+        if check(name):
+            if name == "jpg" and check_feature("libjpeg_turbo"):
+                v = "libjpeg-turbo " + version_feature("libjpeg_turbo")
             else:
-                # Very old MySQL servers..
-                cursor.execute("SHOW TABLE STATUS WHERE Name='{table}'".format(
-                    table=tblname))
-                engine = cursor.fetchone()[1]
-            cursor.execute(droptable)
+                v = version(name)
+            if v is not None:
+                version_static = name in ("pil", "jpg")
+                if name == "littlecms2":
+                    # this check is also in src/_imagingcms.c:setup_module()
+                    version_static = tuple(int(x) for x in v.split(".")) < (2, 7)
+                t = "compiled for" if version_static else "loaded"
+                if name == "raqm":
+                    for f in ("fribidi", "harfbuzz"):
+                        v2 = version_feature(f)
+                        if v2 is not None:
+                            v += f", {f} {v2}"
+                print("---", feature, "support ok,", t, v, file=out)
+            else:
+                print("---", feature, "support ok", file=out)
+        else:
+            print("***", feature, "support not installed", file=out)
+    print("-" * 68, file=out)
 
-        self._cached_storage_engine = engine
-        return engine
+    if supported_formats:
+        extensions = collections.defaultdict(list)
+        for ext, i in Image.EXTENSION.items():
+            extensions[i].append(ext)
 
-    @cached_property
-    def _disabled_supports_transactions(self):
-        return self.mysql_storage_engine == 'InnoDB'
+        for i in sorted(Image.ID):
+            line = f"{i}"
+            if i in Image.MIME:
+                line = f"{line} {Image.MIME[i]}"
+            print(line, file=out)
 
-    @cached_property
-    def can_introspect_foreign_keys(self):
-        """Confirm support for introspected foreign keys
+            if i in extensions:
+                print(
+                    "Extensions: {}".format(", ".join(sorted(extensions[i]))), file=out
+                )
 
-        Only the InnoDB storage engine supports Foreigen Key (not taking
-        into account MySQL Cluster here).
-        """
-        return self.mysql_storage_engine == 'InnoDB'
+            features = []
+            if i in Image.OPEN:
+                features.append("open")
+            if i in Image.SAVE:
+                features.append("save")
+            if i in Image.SAVE_ALL:
+                features.append("save_all")
+            if i in Image.DECODERS:
+                features.append("decode")
+            if i in Image.ENCODERS:
+                features.append("encode")
 
-    @cached_property
-    def has_zoneinfo_database(self):
-        """Tests if the time zone definitions are installed
-
-        MySQL accepts full time zones names (eg. Africa/Nairobi) but rejects
-        abbreviations (eg. EAT). When pytz isn't installed and the current
-        time zone is LocalTimezone (the only sensible value in this context),
-        the current time zone name will be an abbreviation. As a consequence,
-        MySQL cannot perform time zone conversions reliably.
-        """
-        # Django 1.6
-        if not HAVE_PYTZ:
-            return False
-
-        with self.connection.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM mysql.time_zone LIMIT 1")
-            return cursor.fetchall() != []
-
-    def introspected_boolean_field_type(self, *args, **kwargs):
-        # New in Django 1.8
-        return 'IntegerField'
+            print("Features: {}".format(", ".join(features)), file=out)
+            print("-" * 68, file=out)

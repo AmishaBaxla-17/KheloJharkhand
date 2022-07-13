@@ -1,1 +1,2 @@
-__version__ = '1.0.3'
+# Master version for Pillow
+__version__ = "9.0.1"
