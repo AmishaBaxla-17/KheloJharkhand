@@ -1,100 +1,145 @@
 Metadata-Version: 2.1
-Name: MarkupSafe
-Version: 2.0.1
-Summary: Safely add untrusted strings to HTML/XML markup.
-Home-page: https://palletsprojects.com/p/markupsafe/
-Author: Armin Ronacher
-Author-email: armin.ronacher@active-4.com
-Maintainer: Pallets
-Maintainer-email: contact@palletsprojects.com
-License: BSD-3-Clause
-Project-URL: Donate, https://palletsprojects.com/donate
-Project-URL: Documentation, https://markupsafe.palletsprojects.com/
-Project-URL: Changes, https://markupsafe.palletsprojects.com/changes/
-Project-URL: Source Code, https://github.com/pallets/markupsafe/
-Project-URL: Issue Tracker, https://github.com/pallets/markupsafe/issues/
-Project-URL: Twitter, https://twitter.com/PalletsTeam
-Project-URL: Chat, https://discord.gg/pallets
+Name: Pillow
+Version: 9.0.1
+Summary: Python Imaging Library (Fork)
+Home-page: https://python-pillow.org
+Author: Alex Clark (PIL Fork Author)
+Author-email: aclark@python-pillow.org
+License: HPND
+Project-URL: Documentation, https://pillow.readthedocs.io
+Project-URL: Source, https://github.com/python-pillow/Pillow
+Project-URL: Funding, https://tidelift.com/subscription/pkg/pypi-pillow?utm_source=pypi-pillow&utm_medium=pypi
+Project-URL: Release notes, https://pillow.readthedocs.io/en/stable/releasenotes/index.html
+Project-URL: Changelog, https://github.com/python-pillow/Pillow/blob/main/CHANGES.rst
+Project-URL: Twitter, https://twitter.com/PythonPillow
+Keywords: Imaging
 Platform: UNKNOWN
-Classifier: Development Status :: 5 - Production/Stable
-Classifier: Environment :: Web Environment
-Classifier: Intended Audience :: Developers
-Classifier: License :: OSI Approved :: BSD License
-Classifier: Operating System :: OS Independent
-Classifier: Programming Language :: Python
-Classifier: Topic :: Internet :: WWW/HTTP :: Dynamic Content
-Classifier: Topic :: Text Processing :: Markup :: HTML
-Requires-Python: >=3.6
-Description-Content-Type: text/x-rst
+Classifier: Development Status :: 6 - Mature
+Classifier: License :: OSI Approved :: Historical Permission Notice and Disclaimer (HPND)
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: Implementation :: CPython
+Classifier: Programming Language :: Python :: Implementation :: PyPy
+Classifier: Topic :: Multimedia :: Graphics
+Classifier: Topic :: Multimedia :: Graphics :: Capture :: Digital Camera
+Classifier: Topic :: Multimedia :: Graphics :: Capture :: Screen Capture
+Classifier: Topic :: Multimedia :: Graphics :: Graphics Conversion
+Classifier: Topic :: Multimedia :: Graphics :: Viewers
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
 
-MarkupSafe
-==========
+<p align="center">
+    <img width="248" height="250" src="https://raw.githubusercontent.com/python-pillow/pillow-logo/main/pillow-logo-248x250.png" alt="Pillow logo">
+</p>
 
-MarkupSafe implements a text object that escapes characters so it is
-safe to use in HTML and XML. Characters that have special meanings are
-replaced so that they display as the actual characters. This mitigates
-injection attacks, meaning untrusted user input can safely be displayed
-on a page.
+# Pillow
 
+## Python Imaging Library (Fork)
 
-Installing
-----------
+Pillow is the friendly PIL fork by [Alex Clark and
+Contributors](https://github.com/python-pillow/Pillow/graphs/contributors).
+PIL is the Python Imaging Library by Fredrik Lundh and Contributors.
+As of 2019, Pillow development is
+[supported by Tidelift](https://tidelift.com/subscription/pkg/pypi-pillow?utm_source=pypi-pillow&utm_medium=readme&utm_campaign=enterprise).
 
-Install and update using `pip`_:
+<table>
+    <tr>
+        <th>docs</th>
+        <td>
+            <a href="https://pillow.readthedocs.io/?badge=latest"><img
+                alt="Documentation Status"
+                src="https://readthedocs.org/projects/pillow/badge/?version=latest"></a>
+        </td>
+    </tr>
+    <tr>
+        <th>tests</th>
+        <td>
+            <a href="https://github.com/python-pillow/Pillow/actions?query=workflow%3ALint"><img
+                alt="GitHub Actions build status (Lint)"
+                src="https://github.com/python-pillow/Pillow/workflows/Lint/badge.svg"></a>
+            <a href="https://github.com/python-pillow/Pillow/actions?query=workflow%3ATest"><img
+                alt="GitHub Actions build status (Test Linux and macOS)"
+                src="https://github.com/python-pillow/Pillow/workflows/Test/badge.svg"></a>
+            <a href="https://github.com/python-pillow/Pillow/actions?query=workflow%3A%22Test+Windows%22"><img
+                alt="GitHub Actions build status (Test Windows)"
+                src="https://github.com/python-pillow/Pillow/workflows/Test%20Windows/badge.svg"></a>
+            <a href="https://github.com/python-pillow/Pillow/actions?query=workflow%3A%22Test+Docker%22"><img
+                alt="GitHub Actions build status (Test Docker)"
+                src="https://github.com/python-pillow/Pillow/workflows/Test%20Docker/badge.svg"></a>
+            <a href="https://ci.appveyor.com/project/python-pillow/Pillow"><img
+                alt="AppVeyor CI build status (Windows)"
+                src="https://img.shields.io/appveyor/build/python-pillow/Pillow/main.svg?label=Windows%20build"></a>
+            <a href="https://github.com/python-pillow/pillow-wheels/actions"><img
+                alt="GitHub Actions wheels build status (Wheels)"
+                src="https://github.com/python-pillow/pillow-wheels/workflows/Wheels/badge.svg"></a>
+            <a href="https://travis-ci.com/github/python-pillow/pillow-wheels"><img
+                alt="Travis CI wheels build status (aarch64)"
+                src="https://img.shields.io/travis/com/python-pillow/pillow-wheels/main.svg?label=aarch64%20wheels"></a>
+            <a href="https://codecov.io/gh/python-pillow/Pillow"><img
+                alt="Code coverage"
+                src="https://codecov.io/gh/python-pillow/Pillow/branch/main/graph/badge.svg"></a>
+            <a href="https://github.com/python-pillow/Pillow/actions/workflows/tidelift.yml"><img
+                alt="Tidelift Align"
+                src="https://github.com/python-pillow/Pillow/actions/workflows/tidelift.yml/badge.svg"></a>
+        </td>
+    </tr>
+    <tr>
+        <th>package</th>
+        <td>
+            <a href="https://zenodo.org/badge/latestdoi/17549/python-pillow/Pillow"><img
+                alt="Zenodo"
+                src="https://zenodo.org/badge/17549/python-pillow/Pillow.svg"></a>
+            <a href="https://tidelift.com/subscription/pkg/pypi-pillow?utm_source=pypi-pillow&utm_medium=badge"><img
+                alt="Tidelift"
+                src="https://tidelift.com/badges/package/pypi/Pillow?style=flat"></a>
+            <a href="https://pypi.org/project/Pillow/"><img
+                alt="Newest PyPI version"
+                src="https://img.shields.io/pypi/v/pillow.svg"></a>
+            <a href="https://pypi.org/project/Pillow/"><img
+                alt="Number of PyPI downloads"
+                src="https://img.shields.io/pypi/dm/pillow.svg"></a>
+        </td>
+    </tr>
+    <tr>
+        <th>social</th>
+        <td>
+            <a href="https://gitter.im/python-pillow/Pillow?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge"><img
+                alt="Join the chat at https://gitter.im/python-pillow/Pillow"
+                src="https://badges.gitter.im/python-pillow/Pillow.svg"></a>
+            <a href="https://twitter.com/PythonPillow"><img
+                alt="Follow on https://twitter.com/PythonPillow"
+                src="https://img.shields.io/badge/tweet-on%20Twitter-00aced.svg"></a>
+        </td>
+    </tr>
+</table>
 
-.. code-block:: text
+## Overview
 
-    pip install -U MarkupSafe
+The Python Imaging Library adds image processing capabilities to your Python interpreter.
 
-.. _pip: https://pip.pypa.io/en/stable/quickstart/
+This library provides extensive file format support, an efficient internal representation, and fairly powerful image processing capabilities.
 
+The core image library is designed for fast access to data stored in a few basic pixel formats. It should provide a solid foundation for a general image processing tool.
 
-Examples
---------
+## More Information
 
-.. code-block:: pycon
+- [Documentation](https://pillow.readthedocs.io/)
+  - [Installation](https://pillow.readthedocs.io/en/latest/installation.html)
+  - [Handbook](https://pillow.readthedocs.io/en/latest/handbook/index.html)
+- [Contribute](https://github.com/python-pillow/Pillow/blob/main/.github/CONTRIBUTING.md)
+  - [Issues](https://github.com/python-pillow/Pillow/issues)
+  - [Pull requests](https://github.com/python-pillow/Pillow/pulls)
+- [Release notes](https://pillow.readthedocs.io/en/stable/releasenotes/index.html)
+- [Changelog](https://github.com/python-pillow/Pillow/blob/main/CHANGES.rst)
+  - [Pre-fork](https://github.com/python-pillow/Pillow/blob/main/CHANGES.rst#pre-fork)
 
-    >>> from markupsafe import Markup, escape
+## Report a Vulnerability
 
-    >>> # escape replaces special characters and wraps in Markup
-    >>> escape("<script>alert(document.cookie);</script>")
-    Markup('&lt;script&gt;alert(document.cookie);&lt;/script&gt;')
-
-    >>> # wrap in Markup to mark text "safe" and prevent escaping
-    >>> Markup("<strong>Hello</strong>")
-    Markup('<strong>hello</strong>')
-
-    >>> escape(Markup("<strong>Hello</strong>"))
-    Markup('<strong>hello</strong>')
-
-    >>> # Markup is a str subclass
-    >>> # methods and operators escape their arguments
-    >>> template = Markup("Hello <em>{name}</em>")
-    >>> template.format(name='"World"')
-    Markup('Hello <em>&#34;World&#34;</em>')
-
-
-Donate
-------
-
-The Pallets organization develops and supports MarkupSafe and other
-popular packages. In order to grow the community of contributors and
-users, and allow the maintainers to devote more time to the projects,
-`please donate today`_.
-
-.. _please donate today: https://palletsprojects.com/donate
-
-
-Links
------
-
--   Documentation: https://markupsafe.palletsprojects.com/
--   Changes: https://markupsafe.palletsprojects.com/changes/
--   PyPI Releases: https://pypi.org/project/MarkupSafe/
--   Source Code: https://github.com/pallets/markupsafe/
--   Issue Tracker: https://github.com/pallets/markupsafe/issues/
--   Website: https://palletsprojects.com/p/markupsafe/
--   Twitter: https://twitter.com/PalletsTeam
--   Chat: https://discord.gg/pallets
+To report a security vulnerability, please follow the procedure described in the [Tidelift security policy](https://tidelift.com/docs/security).
 
 
