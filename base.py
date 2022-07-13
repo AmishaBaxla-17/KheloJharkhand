@@ -1,39 +1,48 @@
-import abc
-from typing import Optional
+import os
+import site
+import sys
+import sysconfig
+import typing
 
-from pip._vendor.pkg_resources import Distribution
+from pip._internal.utils import appdirs
+from pip._internal.utils.virtualenv import running_under_virtualenv
 
-from pip._internal.index.package_finder import PackageFinder
-from pip._internal.req import InstallRequirement
+# Application Directories
+USER_CACHE_DIR = appdirs.user_cache_dir("pip")
+
+# FIXME doesn't account for venv linked to global site-packages
+site_packages = sysconfig.get_path("purelib")  # type: typing.Optional[str]
 
 
-class AbstractDistribution(metaclass=abc.ABCMeta):
-    """A base class for handling installable artifacts.
-
-    The requirements for anything installable are as follows:
-
-     - we must be able to determine the requirement name
-       (or we can't correctly handle the non-upgrade case).
-
-     - for packages with setup requirements, we must also be able
-       to determine their requirements without installing additional
-       packages (for the same reason as run-time dependencies)
-
-     - we must be able to create a Distribution object exposing the
-       above metadata.
+def get_major_minor_version():
+    # type: () -> str
     """
+    Return the major-minor version of the current Python as a string, e.g.
+    "3.7" or "3.10".
+    """
+    return "{}.{}".format(*sys.version_info)
 
-    def __init__(self, req):
-        # type: (InstallRequirement) -> None
-        super().__init__()
-        self.req = req
 
-    @abc.abstractmethod
-    def get_pkg_resources_distribution(self):
-        # type: () -> Optional[Distribution]
-        raise NotImplementedError()
+def get_src_prefix():
+    # type: () -> str
+    if running_under_virtualenv():
+        src_prefix = os.path.join(sys.prefix, "src")
+    else:
+        # FIXME: keep src in cwd for now (it is not a temporary folder)
+        try:
+            src_prefix = os.path.join(os.getcwd(), "src")
+        except OSError:
+            # In case the current working directory has been renamed or deleted
+            sys.exit("The folder you are executing pip from can no longer be found.")
 
-    @abc.abstractmethod
-    def prepare_distribution_metadata(self, finder, build_isolation):
-        # type: (PackageFinder, bool) -> None
-        raise NotImplementedError()
+    # under macOS + virtualenv sys.prefix is not properly resolved
+    # it is something like /path/to/python/bin/..
+    return os.path.abspath(src_prefix)
+
+
+try:
+    # Use getusersitepackages if this is present, as it ensures that the
+    # value is initialised properly.
+    user_site = site.getusersitepackages()  # type: typing.Optional[str]
+except AttributeError:
+    user_site = site.USER_SITE
