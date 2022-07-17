@@ -1,819 +1,1018 @@
-"""Support for installing and building the "wheel" binary package format.
-"""
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2013-2017 Vinay Sajip.
+# Licensed to the Python Software Foundation under a contributor agreement.
+# See LICENSE.txt and CONTRIBUTORS.txt.
+#
+from __future__ import unicode_literals
 
-import collections
-import compileall
-import contextlib
-import csv
-import importlib
+import base64
+import codecs
+import datetime
+import distutils.util
+from email import message_from_file
+import hashlib
+import imp
+import json
 import logging
-import os.path
+import os
+import posixpath
 import re
 import shutil
 import sys
-import warnings
-from base64 import urlsafe_b64encode
-from email.message import Message
-from itertools import chain, filterfalse, starmap
-from typing import (
-    IO,
-    TYPE_CHECKING,
-    Any,
-    BinaryIO,
-    Callable,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    NewType,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Union,
-    cast,
-)
-from zipfile import ZipFile, ZipInfo
+import tempfile
+import zipfile
 
-from pip._vendor import pkg_resources
-from pip._vendor.distlib.scripts import ScriptMaker
-from pip._vendor.distlib.util import get_export_entry
-from pip._vendor.pkg_resources import Distribution
-from pip._vendor.six import ensure_str, ensure_text, reraise
-
-from pip._internal.exceptions import InstallationError
-from pip._internal.locations import get_major_minor_version
-from pip._internal.models.direct_url import DIRECT_URL_METADATA_NAME, DirectUrl
-from pip._internal.models.scheme import SCHEME_KEYS, Scheme
-from pip._internal.utils.filesystem import adjacent_tmp_file, replace
-from pip._internal.utils.misc import captured_stdout, ensure_dir, hash_file, partition
-from pip._internal.utils.unpacking import (
-    current_umask,
-    is_within_directory,
-    set_extracted_file_to_default_mode_plus_executable,
-    zip_item_is_executable,
-)
-from pip._internal.utils.wheel import parse_wheel, pkg_resources_distribution_for_wheel
-
-if TYPE_CHECKING:
-    from typing import Protocol
-
-    class File(Protocol):
-        src_record_path = None  # type: RecordPath
-        dest_path = None  # type: str
-        changed = None  # type: bool
-
-        def save(self):
-            # type: () -> None
-            pass
-
+from . import __version__, DistlibException
+from .compat import sysconfig, ZipFile, fsdecode, text_type, filter
+from .database import InstalledDistribution
+from .metadata import (Metadata, METADATA_FILENAME, WHEEL_METADATA_FILENAME,
+                       LEGACY_METADATA_FILENAME)
+from .util import (FileOperator, convert_path, CSVReader, CSVWriter, Cache,
+                   cached_property, get_cache_base, read_exports, tempdir)
+from .version import NormalizedVersion, UnsupportedVersionError
 
 logger = logging.getLogger(__name__)
 
-RecordPath = NewType('RecordPath', str)
-InstalledCSVRow = Tuple[RecordPath, str, Union[int, str]]
+cache = None    # created when needed
+
+if hasattr(sys, 'pypy_version_info'):  # pragma: no cover
+    IMP_PREFIX = 'pp'
+elif sys.platform.startswith('java'):  # pragma: no cover
+    IMP_PREFIX = 'jy'
+elif sys.platform == 'cli':  # pragma: no cover
+    IMP_PREFIX = 'ip'
+else:
+    IMP_PREFIX = 'cp'
+
+VER_SUFFIX = sysconfig.get_config_var('py_version_nodot')
+if not VER_SUFFIX:   # pragma: no cover
+    VER_SUFFIX = '%s%s' % sys.version_info[:2]
+PYVER = 'py' + VER_SUFFIX
+IMPVER = IMP_PREFIX + VER_SUFFIX
+
+ARCH = distutils.util.get_platform().replace('-', '_').replace('.', '_')
+
+ABI = sysconfig.get_config_var('SOABI')
+if ABI and ABI.startswith('cpython-'):
+    ABI = ABI.replace('cpython-', 'cp')
+else:
+    def _derive_abi():
+        parts = ['cp', VER_SUFFIX]
+        if sysconfig.get_config_var('Py_DEBUG'):
+            parts.append('d')
+        if sysconfig.get_config_var('WITH_PYMALLOC'):
+            parts.append('m')
+        if sysconfig.get_config_var('Py_UNICODE_SIZE') == 4:
+            parts.append('u')
+        return ''.join(parts)
+    ABI = _derive_abi()
+    del _derive_abi
+
+FILENAME_RE = re.compile(r'''
+(?P<nm>[^-]+)
+-(?P<vn>\d+[^-]*)
+(-(?P<bn>\d+[^-]*))?
+-(?P<py>\w+\d+(\.\w+\d+)*)
+-(?P<bi>\w+)
+-(?P<ar>\w+(\.\w+)*)
+\.whl$
+''', re.IGNORECASE | re.VERBOSE)
+
+NAME_VERSION_RE = re.compile(r'''
+(?P<nm>[^-]+)
+-(?P<vn>\d+[^-]*)
+(-(?P<bn>\d+[^-]*))?$
+''', re.IGNORECASE | re.VERBOSE)
+
+SHEBANG_RE = re.compile(br'\s*#![^\r\n]*')
+SHEBANG_DETAIL_RE = re.compile(br'^(\s*#!("[^"]+"|\S+))\s+(.*)$')
+SHEBANG_PYTHON = b'#!python'
+SHEBANG_PYTHONW = b'#!pythonw'
+
+if os.sep == '/':
+    to_posix = lambda o: o
+else:
+    to_posix = lambda o: o.replace(os.sep, '/')
 
 
-def rehash(path, blocksize=1 << 20):
-    # type: (str, int) -> Tuple[str, str]
-    """Return (encoded_digest, length) for path using hashlib.sha256()"""
-    h, length = hash_file(path, blocksize)
-    digest = 'sha256=' + urlsafe_b64encode(
-        h.digest()
-    ).decode('latin1').rstrip('=')
-    return (digest, str(length))
+class Mounter(object):
+    def __init__(self):
+        self.impure_wheels = {}
+        self.libs = {}
+
+    def add(self, pathname, extensions):
+        self.impure_wheels[pathname] = extensions
+        self.libs.update(extensions)
+
+    def remove(self, pathname):
+        extensions = self.impure_wheels.pop(pathname)
+        for k, v in extensions:
+            if k in self.libs:
+                del self.libs[k]
+
+    def find_module(self, fullname, path=None):
+        if fullname in self.libs:
+            result = self
+        else:
+            result = None
+        return result
+
+    def load_module(self, fullname):
+        if fullname in sys.modules:
+            result = sys.modules[fullname]
+        else:
+            if fullname not in self.libs:
+                raise ImportError('unable to find extension for %s' % fullname)
+            result = imp.load_dynamic(fullname, self.libs[fullname])
+            result.__loader__ = self
+            parts = fullname.rsplit('.', 1)
+            if len(parts) > 1:
+                result.__package__ = parts[0]
+        return result
+
+_hook = Mounter()
 
 
-def csv_io_kwargs(mode):
-    # type: (str) -> Dict[str, Any]
-    """Return keyword arguments to properly open a CSV file
-    in the given mode.
+class Wheel(object):
     """
-    return {'mode': mode, 'newline': '', 'encoding': 'utf-8'}
-
-
-def fix_script(path):
-    # type: (str) -> bool
-    """Replace #!python with #!/path/to/python
-    Return True if file was changed.
+    Class to build and install from Wheel files (PEP 427).
     """
-    # XXX RECORD hashes will need to be updated
-    assert os.path.isfile(path)
 
-    with open(path, 'rb') as script:
-        firstline = script.readline()
-        if not firstline.startswith(b'#!python'):
-            return False
-        exename = sys.executable.encode(sys.getfilesystemencoding())
-        firstline = b'#!' + exename + os.linesep.encode("ascii")
-        rest = script.read()
-    with open(path, 'wb') as script:
-        script.write(firstline)
-        script.write(rest)
-    return True
+    wheel_version = (1, 1)
+    hash_kind = 'sha256'
 
-
-def wheel_root_is_purelib(metadata):
-    # type: (Message) -> bool
-    return metadata.get("Root-Is-Purelib", "").lower() == "true"
-
-
-def get_entrypoints(distribution):
-    # type: (Distribution) -> Tuple[Dict[str, str], Dict[str, str]]
-    # get the entry points and then the script names
-    try:
-        console = distribution.get_entry_map('console_scripts')
-        gui = distribution.get_entry_map('gui_scripts')
-    except KeyError:
-        # Our dict-based Distribution raises KeyError if entry_points.txt
-        # doesn't exist.
-        return {}, {}
-
-    def _split_ep(s):
-        # type: (pkg_resources.EntryPoint) -> Tuple[str, str]
-        """get the string representation of EntryPoint,
-        remove space and split on '='
+    def __init__(self, filename=None, sign=False, verify=False):
         """
-        split_parts = str(s).replace(" ", "").split("=")
-        return split_parts[0], split_parts[1]
-
-    # convert the EntryPoint objects into strings with module:function
-    console = dict(_split_ep(v) for v in console.values())
-    gui = dict(_split_ep(v) for v in gui.values())
-    return console, gui
-
-
-def message_about_scripts_not_on_PATH(scripts):
-    # type: (Sequence[str]) -> Optional[str]
-    """Determine if any scripts are not on PATH and format a warning.
-    Returns a warning message if one or more scripts are not on PATH,
-    otherwise None.
-    """
-    if not scripts:
-        return None
-
-    # Group scripts by the path they were installed in
-    grouped_by_dir = collections.defaultdict(set)  # type: Dict[str, Set[str]]
-    for destfile in scripts:
-        parent_dir = os.path.dirname(destfile)
-        script_name = os.path.basename(destfile)
-        grouped_by_dir[parent_dir].add(script_name)
-
-    # We don't want to warn for directories that are on PATH.
-    not_warn_dirs = [
-        os.path.normcase(i).rstrip(os.sep) for i in
-        os.environ.get("PATH", "").split(os.pathsep)
-    ]
-    # If an executable sits with sys.executable, we don't warn for it.
-    #     This covers the case of venv invocations without activating the venv.
-    not_warn_dirs.append(os.path.normcase(os.path.dirname(sys.executable)))
-    warn_for = {
-        parent_dir: scripts for parent_dir, scripts in grouped_by_dir.items()
-        if os.path.normcase(parent_dir) not in not_warn_dirs
-    }  # type: Dict[str, Set[str]]
-    if not warn_for:
-        return None
-
-    # Format a message
-    msg_lines = []
-    for parent_dir, dir_scripts in warn_for.items():
-        sorted_scripts = sorted(dir_scripts)  # type: List[str]
-        if len(sorted_scripts) == 1:
-            start_text = "script {} is".format(sorted_scripts[0])
+        Initialise an instance using a (valid) filename.
+        """
+        self.sign = sign
+        self.should_verify = verify
+        self.buildver = ''
+        self.pyver = [PYVER]
+        self.abi = ['none']
+        self.arch = ['any']
+        self.dirname = os.getcwd()
+        if filename is None:
+            self.name = 'dummy'
+            self.version = '0.1'
+            self._filename = self.filename
         else:
-            start_text = "scripts {} are".format(
-                ", ".join(sorted_scripts[:-1]) + " and " + sorted_scripts[-1]
-            )
+            m = NAME_VERSION_RE.match(filename)
+            if m:
+                info = m.groupdict('')
+                self.name = info['nm']
+                # Reinstate the local version separator
+                self.version = info['vn'].replace('_', '-')
+                self.buildver = info['bn']
+                self._filename = self.filename
+            else:
+                dirname, filename = os.path.split(filename)
+                m = FILENAME_RE.match(filename)
+                if not m:
+                    raise DistlibException('Invalid name or '
+                                           'filename: %r' % filename)
+                if dirname:
+                    self.dirname = os.path.abspath(dirname)
+                self._filename = filename
+                info = m.groupdict('')
+                self.name = info['nm']
+                self.version = info['vn']
+                self.buildver = info['bn']
+                self.pyver = info['py'].split('.')
+                self.abi = info['bi'].split('.')
+                self.arch = info['ar'].split('.')
 
-        msg_lines.append(
-            "The {} installed in '{}' which is not on PATH."
-            .format(start_text, parent_dir)
-        )
-
-    last_line_fmt = (
-        "Consider adding {} to PATH or, if you prefer "
-        "to suppress this warning, use --no-warn-script-location."
-    )
-    if len(msg_lines) == 1:
-        msg_lines.append(last_line_fmt.format("this directory"))
-    else:
-        msg_lines.append(last_line_fmt.format("these directories"))
-
-    # Add a note if any directory starts with ~
-    warn_for_tilde = any(
-        i[0] == "~" for i in os.environ.get("PATH", "").split(os.pathsep) if i
-    )
-    if warn_for_tilde:
-        tilde_warning_msg = (
-            "NOTE: The current PATH contains path(s) starting with `~`, "
-            "which may not be expanded by all applications."
-        )
-        msg_lines.append(tilde_warning_msg)
-
-    # Returns the formatted multiline message
-    return "\n".join(msg_lines)
-
-
-def _normalized_outrows(outrows):
-    # type: (Iterable[InstalledCSVRow]) -> List[Tuple[str, str, str]]
-    """Normalize the given rows of a RECORD file.
-
-    Items in each row are converted into str. Rows are then sorted to make
-    the value more predictable for tests.
-
-    Each row is a 3-tuple (path, hash, size) and corresponds to a record of
-    a RECORD file (see PEP 376 and PEP 427 for details).  For the rows
-    passed to this function, the size can be an integer as an int or string,
-    or the empty string.
-    """
-    # Normally, there should only be one row per path, in which case the
-    # second and third elements don't come into play when sorting.
-    # However, in cases in the wild where a path might happen to occur twice,
-    # we don't want the sort operation to trigger an error (but still want
-    # determinism).  Since the third element can be an int or string, we
-    # coerce each element to a string to avoid a TypeError in this case.
-    # For additional background, see--
-    # https://github.com/pypa/pip/issues/5868
-    return sorted(
-        (ensure_str(record_path, encoding='utf-8'), hash_, str(size))
-        for record_path, hash_, size in outrows
-    )
-
-
-def _record_to_fs_path(record_path):
-    # type: (RecordPath) -> str
-    return record_path
-
-
-def _fs_to_record_path(path, relative_to=None):
-    # type: (str, Optional[str]) -> RecordPath
-    if relative_to is not None:
-        # On Windows, do not handle relative paths if they belong to different
-        # logical disks
-        if os.path.splitdrive(path)[0].lower() == \
-                os.path.splitdrive(relative_to)[0].lower():
-            path = os.path.relpath(path, relative_to)
-    path = path.replace(os.path.sep, '/')
-    return cast('RecordPath', path)
-
-
-def _parse_record_path(record_column):
-    # type: (str) -> RecordPath
-    p = ensure_text(record_column, encoding='utf-8')
-    return cast('RecordPath', p)
-
-
-def get_csv_rows_for_installed(
-    old_csv_rows,  # type: List[List[str]]
-    installed,  # type: Dict[RecordPath, RecordPath]
-    changed,  # type: Set[RecordPath]
-    generated,  # type: List[str]
-    lib_dir,  # type: str
-):
-    # type: (...) -> List[InstalledCSVRow]
-    """
-    :param installed: A map from archive RECORD path to installation RECORD
-        path.
-    """
-    installed_rows = []  # type: List[InstalledCSVRow]
-    for row in old_csv_rows:
-        if len(row) > 3:
-            logger.warning('RECORD line has more than three elements: %s', row)
-        old_record_path = _parse_record_path(row[0])
-        new_record_path = installed.pop(old_record_path, old_record_path)
-        if new_record_path in changed:
-            digest, length = rehash(_record_to_fs_path(new_record_path))
+    @property
+    def filename(self):
+        """
+        Build and return a filename from the various components.
+        """
+        if self.buildver:
+            buildver = '-' + self.buildver
         else:
-            digest = row[1] if len(row) > 1 else ''
-            length = row[2] if len(row) > 2 else ''
-        installed_rows.append((new_record_path, digest, length))
-    for f in generated:
-        path = _fs_to_record_path(f, lib_dir)
-        digest, length = rehash(f)
-        installed_rows.append((path, digest, length))
-    for installed_record_path in installed.values():
-        installed_rows.append((installed_record_path, '', ''))
-    return installed_rows
+            buildver = ''
+        pyver = '.'.join(self.pyver)
+        abi = '.'.join(self.abi)
+        arch = '.'.join(self.arch)
+        # replace - with _ as a local version separator
+        version = self.version.replace('-', '_')
+        return '%s-%s%s-%s-%s-%s.whl' % (self.name, version, buildver,
+                                         pyver, abi, arch)
 
+    @property
+    def exists(self):
+        path = os.path.join(self.dirname, self.filename)
+        return os.path.isfile(path)
 
-def get_console_script_specs(console):
-    # type: (Dict[str, str]) -> List[str]
-    """
-    Given the mapping from entrypoint name to callable, return the relevant
-    console script specs.
-    """
-    # Don't mutate caller's version
-    console = console.copy()
+    @property
+    def tags(self):
+        for pyver in self.pyver:
+            for abi in self.abi:
+                for arch in self.arch:
+                    yield pyver, abi, arch
 
-    scripts_to_generate = []
+    @cached_property
+    def metadata(self):
+        pathname = os.path.join(self.dirname, self.filename)
+        name_ver = '%s-%s' % (self.name, self.version)
+        info_dir = '%s.dist-info' % name_ver
+        wrapper = codecs.getreader('utf-8')
+        with ZipFile(pathname, 'r') as zf:
+            wheel_metadata = self.get_wheel_metadata(zf)
+            wv = wheel_metadata['Wheel-Version'].split('.', 1)
+            file_version = tuple([int(i) for i in wv])
+            # if file_version < (1, 1):
+                # fns = [WHEEL_METADATA_FILENAME, METADATA_FILENAME,
+                       # LEGACY_METADATA_FILENAME]
+            # else:
+                # fns = [WHEEL_METADATA_FILENAME, METADATA_FILENAME]
+            fns = [WHEEL_METADATA_FILENAME, LEGACY_METADATA_FILENAME]
+            result = None
+            for fn in fns:
+                try:
+                    metadata_filename = posixpath.join(info_dir, fn)
+                    with zf.open(metadata_filename) as bf:
+                        wf = wrapper(bf)
+                        result = Metadata(fileobj=wf)
+                        if result:
+                            break
+                except KeyError:
+                    pass
+            if not result:
+                raise ValueError('Invalid wheel, because metadata is '
+                                 'missing: looked in %s' % ', '.join(fns))
+        return result
 
-    # Special case pip and setuptools to generate versioned wrappers
-    #
-    # The issue is that some projects (specifically, pip and setuptools) use
-    # code in setup.py to create "versioned" entry points - pip2.7 on Python
-    # 2.7, pip3.3 on Python 3.3, etc. But these entry points are baked into
-    # the wheel metadata at build time, and so if the wheel is installed with
-    # a *different* version of Python the entry points will be wrong. The
-    # correct fix for this is to enhance the metadata to be able to describe
-    # such versioned entry points, but that won't happen till Metadata 2.0 is
-    # available.
-    # In the meantime, projects using versioned entry points will either have
-    # incorrect versioned entry points, or they will not be able to distribute
-    # "universal" wheels (i.e., they will need a wheel per Python version).
-    #
-    # Because setuptools and pip are bundled with _ensurepip and virtualenv,
-    # we need to use universal wheels. So, as a stopgap until Metadata 2.0, we
-    # override the versioned entry points in the wheel and generate the
-    # correct ones. This code is purely a short-term measure until Metadata 2.0
-    # is available.
-    #
-    # To add the level of hack in this section of code, in order to support
-    # ensurepip this code will look for an ``ENSUREPIP_OPTIONS`` environment
-    # variable which will control which version scripts get installed.
-    #
-    # ENSUREPIP_OPTIONS=altinstall
-    #   - Only pipX.Y and easy_install-X.Y will be generated and installed
-    # ENSUREPIP_OPTIONS=install
-    #   - pipX.Y, pipX, easy_install-X.Y will be generated and installed. Note
-    #     that this option is technically if ENSUREPIP_OPTIONS is set and is
-    #     not altinstall
-    # DEFAULT
-    #   - The default behavior is to install pip, pipX, pipX.Y, easy_install
-    #     and easy_install-X.Y.
-    pip_script = console.pop('pip', None)
-    if pip_script:
-        if "ENSUREPIP_OPTIONS" not in os.environ:
-            scripts_to_generate.append('pip = ' + pip_script)
+    def get_wheel_metadata(self, zf):
+        name_ver = '%s-%s' % (self.name, self.version)
+        info_dir = '%s.dist-info' % name_ver
+        metadata_filename = posixpath.join(info_dir, 'WHEEL')
+        with zf.open(metadata_filename) as bf:
+            wf = codecs.getreader('utf-8')(bf)
+            message = message_from_file(wf)
+        return dict(message)
 
-        if os.environ.get("ENSUREPIP_OPTIONS", "") != "altinstall":
-            scripts_to_generate.append(
-                'pip{} = {}'.format(sys.version_info[0], pip_script)
-            )
+    @cached_property
+    def info(self):
+        pathname = os.path.join(self.dirname, self.filename)
+        with ZipFile(pathname, 'r') as zf:
+            result = self.get_wheel_metadata(zf)
+        return result
 
-        scripts_to_generate.append(
-            f'pip{get_major_minor_version()} = {pip_script}'
-        )
-        # Delete any other versioned pip entry points
-        pip_ep = [k for k in console if re.match(r'pip(\d(\.\d)?)?$', k)]
-        for k in pip_ep:
-            del console[k]
-    easy_install_script = console.pop('easy_install', None)
-    if easy_install_script:
-        if "ENSUREPIP_OPTIONS" not in os.environ:
-            scripts_to_generate.append(
-                'easy_install = ' + easy_install_script
-            )
+    def process_shebang(self, data):
+        m = SHEBANG_RE.match(data)
+        if m:
+            end = m.end()
+            shebang, data_after_shebang = data[:end], data[end:]
+            # Preserve any arguments after the interpreter
+            if b'pythonw' in shebang.lower():
+                shebang_python = SHEBANG_PYTHONW
+            else:
+                shebang_python = SHEBANG_PYTHON
+            m = SHEBANG_DETAIL_RE.match(shebang)
+            if m:
+                args = b' ' + m.groups()[-1]
+            else:
+                args = b''
+            shebang = shebang_python + args
+            data = shebang + data_after_shebang
+        else:
+            cr = data.find(b'\r')
+            lf = data.find(b'\n')
+            if cr < 0 or cr > lf:
+                term = b'\n'
+            else:
+                if data[cr:cr + 2] == b'\r\n':
+                    term = b'\r\n'
+                else:
+                    term = b'\r'
+            data = SHEBANG_PYTHON + term + data
+        return data
 
-        scripts_to_generate.append(
-            'easy_install-{} = {}'.format(
-                get_major_minor_version(), easy_install_script
-            )
-        )
-        # Delete any other versioned easy_install entry points
-        easy_install_ep = [
-            k for k in console if re.match(r'easy_install(-\d\.\d)?$', k)
+    def get_hash(self, data, hash_kind=None):
+        if hash_kind is None:
+            hash_kind = self.hash_kind
+        try:
+            hasher = getattr(hashlib, hash_kind)
+        except AttributeError:
+            raise DistlibException('Unsupported hash algorithm: %r' % hash_kind)
+        result = hasher(data).digest()
+        result = base64.urlsafe_b64encode(result).rstrip(b'=').decode('ascii')
+        return hash_kind, result
+
+    def write_record(self, records, record_path, base):
+        records = list(records) # make a copy, as mutated
+        p = to_posix(os.path.relpath(record_path, base))
+        records.append((p, '', ''))
+        with CSVWriter(record_path) as writer:
+            for row in records:
+                writer.writerow(row)
+
+    def write_records(self, info, libdir, archive_paths):
+        records = []
+        distinfo, info_dir = info
+        hasher = getattr(hashlib, self.hash_kind)
+        for ap, p in archive_paths:
+            with open(p, 'rb') as f:
+                data = f.read()
+            digest = '%s=%s' % self.get_hash(data)
+            size = os.path.getsize(p)
+            records.append((ap, digest, size))
+
+        p = os.path.join(distinfo, 'RECORD')
+        self.write_record(records, p, libdir)
+        ap = to_posix(os.path.join(info_dir, 'RECORD'))
+        archive_paths.append((ap, p))
+
+    def build_zip(self, pathname, archive_paths):
+        with ZipFile(pathname, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for ap, p in archive_paths:
+                logger.debug('Wrote %s to %s in wheel', p, ap)
+                zf.write(p, ap)
+
+    def build(self, paths, tags=None, wheel_version=None):
+        """
+        Build a wheel from files in specified paths, and use any specified tags
+        when determining the name of the wheel.
+        """
+        if tags is None:
+            tags = {}
+
+        libkey = list(filter(lambda o: o in paths, ('purelib', 'platlib')))[0]
+        if libkey == 'platlib':
+            is_pure = 'false'
+            default_pyver = [IMPVER]
+            default_abi = [ABI]
+            default_arch = [ARCH]
+        else:
+            is_pure = 'true'
+            default_pyver = [PYVER]
+            default_abi = ['none']
+            default_arch = ['any']
+
+        self.pyver = tags.get('pyver', default_pyver)
+        self.abi = tags.get('abi', default_abi)
+        self.arch = tags.get('arch', default_arch)
+
+        libdir = paths[libkey]
+
+        name_ver = '%s-%s' % (self.name, self.version)
+        data_dir = '%s.data' % name_ver
+        info_dir = '%s.dist-info' % name_ver
+
+        archive_paths = []
+
+        # First, stuff which is not in site-packages
+        for key in ('data', 'headers', 'scripts'):
+            if key not in paths:
+                continue
+            path = paths[key]
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for fn in files:
+                        p = fsdecode(os.path.join(root, fn))
+                        rp = os.path.relpath(p, path)
+                        ap = to_posix(os.path.join(data_dir, key, rp))
+                        archive_paths.append((ap, p))
+                        if key == 'scripts' and not p.endswith('.exe'):
+                            with open(p, 'rb') as f:
+                                data = f.read()
+                            data = self.process_shebang(data)
+                            with open(p, 'wb') as f:
+                                f.write(data)
+
+        # Now, stuff which is in site-packages, other than the
+        # distinfo stuff.
+        path = libdir
+        distinfo = None
+        for root, dirs, files in os.walk(path):
+            if root == path:
+                # At the top level only, save distinfo for later
+                # and skip it for now
+                for i, dn in enumerate(dirs):
+                    dn = fsdecode(dn)
+                    if dn.endswith('.dist-info'):
+                        distinfo = os.path.join(root, dn)
+                        del dirs[i]
+                        break
+                assert distinfo, '.dist-info directory expected, not found'
+
+            for fn in files:
+                # comment out next suite to leave .pyc files in
+                if fsdecode(fn).endswith(('.pyc', '.pyo')):
+                    continue
+                p = os.path.join(root, fn)
+                rp = to_posix(os.path.relpath(p, path))
+                archive_paths.append((rp, p))
+
+        # Now distinfo. Assumed to be flat, i.e. os.listdir is enough.
+        files = os.listdir(distinfo)
+        for fn in files:
+            if fn not in ('RECORD', 'INSTALLER', 'SHARED', 'WHEEL'):
+                p = fsdecode(os.path.join(distinfo, fn))
+                ap = to_posix(os.path.join(info_dir, fn))
+                archive_paths.append((ap, p))
+
+        wheel_metadata = [
+            'Wheel-Version: %d.%d' % (wheel_version or self.wheel_version),
+            'Generator: distlib %s' % __version__,
+            'Root-Is-Purelib: %s' % is_pure,
         ]
-        for k in easy_install_ep:
-            del console[k]
+        for pyver, abi, arch in self.tags:
+            wheel_metadata.append('Tag: %s-%s-%s' % (pyver, abi, arch))
+        p = os.path.join(distinfo, 'WHEEL')
+        with open(p, 'w') as f:
+            f.write('\n'.join(wheel_metadata))
+        ap = to_posix(os.path.join(info_dir, 'WHEEL'))
+        archive_paths.append((ap, p))
 
-    # Generate the console entry points specified in the wheel
-    scripts_to_generate.extend(starmap('{} = {}'.format, console.items()))
+        # sort the entries by archive path. Not needed by any spec, but it
+        # keeps the archive listing and RECORD tidier than they would otherwise
+        # be. Use the number of path segments to keep directory entries together,
+        # and keep the dist-info stuff at the end.
+        def sorter(t):
+            ap = t[0]
+            n = ap.count('/')
+            if '.dist-info' in ap:
+                n += 10000
+            return (n, ap)
+        archive_paths = sorted(archive_paths, key=sorter)
 
-    return scripts_to_generate
+        # Now, at last, RECORD.
+        # Paths in here are archive paths - nothing else makes sense.
+        self.write_records((distinfo, info_dir), libdir, archive_paths)
+        # Now, ready to build the zip file
+        pathname = os.path.join(self.dirname, self.filename)
+        self.build_zip(pathname, archive_paths)
+        return pathname
 
-
-class ZipBackedFile:
-    def __init__(self, src_record_path, dest_path, zip_file):
-        # type: (RecordPath, str, ZipFile) -> None
-        self.src_record_path = src_record_path
-        self.dest_path = dest_path
-        self._zip_file = zip_file
-        self.changed = False
-
-    def _getinfo(self):
-        # type: () -> ZipInfo
-        return self._zip_file.getinfo(self.src_record_path)
-
-    def save(self):
-        # type: () -> None
-        # directory creation is lazy and after file filtering
-        # to ensure we don't install empty dirs; empty dirs can't be
-        # uninstalled.
-        parent_dir = os.path.dirname(self.dest_path)
-        ensure_dir(parent_dir)
-
-        # When we open the output file below, any existing file is truncated
-        # before we start writing the new contents. This is fine in most
-        # cases, but can cause a segfault if pip has loaded a shared
-        # object (e.g. from pyopenssl through its vendored urllib3)
-        # Since the shared object is mmap'd an attempt to call a
-        # symbol in it will then cause a segfault. Unlinking the file
-        # allows writing of new contents while allowing the process to
-        # continue to use the old copy.
-        if os.path.exists(self.dest_path):
-            os.unlink(self.dest_path)
-
-        zipinfo = self._getinfo()
-
-        with self._zip_file.open(zipinfo) as f:
-            with open(self.dest_path, "wb") as dest:
-                shutil.copyfileobj(f, dest)
-
-        if zip_item_is_executable(zipinfo):
-            set_extracted_file_to_default_mode_plus_executable(self.dest_path)
-
-
-class ScriptFile:
-    def __init__(self, file):
-        # type: (File) -> None
-        self._file = file
-        self.src_record_path = self._file.src_record_path
-        self.dest_path = self._file.dest_path
-        self.changed = False
-
-    def save(self):
-        # type: () -> None
-        self._file.save()
-        self.changed = fix_script(self.dest_path)
-
-
-class MissingCallableSuffix(InstallationError):
-    def __init__(self, entry_point):
-        # type: (str) -> None
-        super().__init__(
-            "Invalid script entry point: {} - A callable "
-            "suffix is required. Cf https://packaging.python.org/"
-            "specifications/entry-points/#use-for-scripts for more "
-            "information.".format(entry_point)
-        )
-
-
-def _raise_for_invalid_entrypoint(specification):
-    # type: (str) -> None
-    entry = get_export_entry(specification)
-    if entry is not None and entry.suffix is None:
-        raise MissingCallableSuffix(str(entry))
-
-
-class PipScriptMaker(ScriptMaker):
-    def make(self, specification, options=None):
-        # type: (str, Dict[str, Any]) -> List[str]
-        _raise_for_invalid_entrypoint(specification)
-        return super().make(specification, options)
-
-
-def _install_wheel(
-    name,  # type: str
-    wheel_zip,  # type: ZipFile
-    wheel_path,  # type: str
-    scheme,  # type: Scheme
-    pycompile=True,  # type: bool
-    warn_script_location=True,  # type: bool
-    direct_url=None,  # type: Optional[DirectUrl]
-    requested=False,  # type: bool
-):
-    # type: (...) -> None
-    """Install a wheel.
-
-    :param name: Name of the project to install
-    :param wheel_zip: open ZipFile for wheel being installed
-    :param scheme: Distutils scheme dictating the install directories
-    :param req_description: String used in place of the requirement, for
-        logging
-    :param pycompile: Whether to byte-compile installed Python files
-    :param warn_script_location: Whether to check that scripts are installed
-        into a directory on PATH
-    :raises UnsupportedWheel:
-        * when the directory holds an unpacked wheel with incompatible
-          Wheel-Version
-        * when the .dist-info dir does not match the wheel
-    """
-    info_dir, metadata = parse_wheel(wheel_zip, name)
-
-    if wheel_root_is_purelib(metadata):
-        lib_dir = scheme.purelib
-    else:
-        lib_dir = scheme.platlib
-
-    # Record details of the files moved
-    #   installed = files copied from the wheel to the destination
-    #   changed = files changed while installing (scripts #! line typically)
-    #   generated = files newly generated during the install (script wrappers)
-    installed = {}  # type: Dict[RecordPath, RecordPath]
-    changed = set()  # type: Set[RecordPath]
-    generated = []  # type: List[str]
-
-    def record_installed(srcfile, destfile, modified=False):
-        # type: (RecordPath, str, bool) -> None
-        """Map archive RECORD paths to installation RECORD paths."""
-        newpath = _fs_to_record_path(destfile, lib_dir)
-        installed[srcfile] = newpath
-        if modified:
-            changed.add(_fs_to_record_path(destfile))
-
-    def all_paths():
-        # type: () -> Iterable[RecordPath]
-        names = wheel_zip.namelist()
-        # If a flag is set, names may be unicode in Python 2. We convert to
-        # text explicitly so these are valid for lookup in RECORD.
-        decoded_names = map(ensure_text, names)
-        for name in decoded_names:
-            yield cast("RecordPath", name)
-
-    def is_dir_path(path):
-        # type: (RecordPath) -> bool
-        return path.endswith("/")
-
-    def assert_no_path_traversal(dest_dir_path, target_path):
-        # type: (str, str) -> None
-        if not is_within_directory(dest_dir_path, target_path):
-            message = (
-                "The wheel {!r} has a file {!r} trying to install"
-                " outside the target directory {!r}"
-            )
-            raise InstallationError(
-                message.format(wheel_path, target_path, dest_dir_path)
-            )
-
-    def root_scheme_file_maker(zip_file, dest):
-        # type: (ZipFile, str) -> Callable[[RecordPath], File]
-        def make_root_scheme_file(record_path):
-            # type: (RecordPath) -> File
-            normed_path = os.path.normpath(record_path)
-            dest_path = os.path.join(dest, normed_path)
-            assert_no_path_traversal(dest, dest_path)
-            return ZipBackedFile(record_path, dest_path, zip_file)
-
-        return make_root_scheme_file
-
-    def data_scheme_file_maker(zip_file, scheme):
-        # type: (ZipFile, Scheme) -> Callable[[RecordPath], File]
-        scheme_paths = {}
-        for key in SCHEME_KEYS:
-            encoded_key = ensure_text(key)
-            scheme_paths[encoded_key] = ensure_text(
-                getattr(scheme, key), encoding=sys.getfilesystemencoding()
-            )
-
-        def make_data_scheme_file(record_path):
-            # type: (RecordPath) -> File
-            normed_path = os.path.normpath(record_path)
-            try:
-                _, scheme_key, dest_subpath = normed_path.split(os.path.sep, 2)
-            except ValueError:
-                message = (
-                    "Unexpected file in {}: {!r}. .data directory contents"
-                    " should be named like: '<scheme key>/<path>'."
-                ).format(wheel_path, record_path)
-                raise InstallationError(message)
-
-            try:
-                scheme_path = scheme_paths[scheme_key]
-            except KeyError:
-                valid_scheme_keys = ", ".join(sorted(scheme_paths))
-                message = (
-                    "Unknown scheme key used in {}: {} (for file {!r}). .data"
-                    " directory contents should be in subdirectories named"
-                    " with a valid scheme key ({})"
-                ).format(
-                    wheel_path, scheme_key, record_path, valid_scheme_keys
-                )
-                raise InstallationError(message)
-
-            dest_path = os.path.join(scheme_path, dest_subpath)
-            assert_no_path_traversal(scheme_path, dest_path)
-            return ZipBackedFile(record_path, dest_path, zip_file)
-
-        return make_data_scheme_file
-
-    def is_data_scheme_path(path):
-        # type: (RecordPath) -> bool
-        return path.split("/", 1)[0].endswith(".data")
-
-    paths = all_paths()
-    file_paths = filterfalse(is_dir_path, paths)
-    root_scheme_paths, data_scheme_paths = partition(
-        is_data_scheme_path, file_paths
-    )
-
-    make_root_scheme_file = root_scheme_file_maker(
-        wheel_zip,
-        ensure_text(lib_dir, encoding=sys.getfilesystemencoding()),
-    )
-    files = map(make_root_scheme_file, root_scheme_paths)
-
-    def is_script_scheme_path(path):
-        # type: (RecordPath) -> bool
-        parts = path.split("/", 2)
-        return (
-            len(parts) > 2 and
-            parts[0].endswith(".data") and
-            parts[1] == "scripts"
-        )
-
-    other_scheme_paths, script_scheme_paths = partition(
-        is_script_scheme_path, data_scheme_paths
-    )
-
-    make_data_scheme_file = data_scheme_file_maker(wheel_zip, scheme)
-    other_scheme_files = map(make_data_scheme_file, other_scheme_paths)
-    files = chain(files, other_scheme_files)
-
-    # Get the defined entry points
-    distribution = pkg_resources_distribution_for_wheel(
-        wheel_zip, name, wheel_path
-    )
-    console, gui = get_entrypoints(distribution)
-
-    def is_entrypoint_wrapper(file):
-        # type: (File) -> bool
-        # EP, EP.exe and EP-script.py are scripts generated for
-        # entry point EP by setuptools
-        path = file.dest_path
-        name = os.path.basename(path)
-        if name.lower().endswith('.exe'):
-            matchname = name[:-4]
-        elif name.lower().endswith('-script.py'):
-            matchname = name[:-10]
-        elif name.lower().endswith(".pya"):
-            matchname = name[:-4]
-        else:
-            matchname = name
-        # Ignore setuptools-generated scripts
-        return (matchname in console or matchname in gui)
-
-    script_scheme_files = map(make_data_scheme_file, script_scheme_paths)
-    script_scheme_files = filterfalse(
-        is_entrypoint_wrapper, script_scheme_files
-    )
-    script_scheme_files = map(ScriptFile, script_scheme_files)
-    files = chain(files, script_scheme_files)
-
-    for file in files:
-        file.save()
-        record_installed(file.src_record_path, file.dest_path, file.changed)
-
-    def pyc_source_file_paths():
-        # type: () -> Iterator[str]
-        # We de-duplicate installation paths, since there can be overlap (e.g.
-        # file in .data maps to same location as file in wheel root).
-        # Sorting installation paths makes it easier to reproduce and debug
-        # issues related to permissions on existing files.
-        for installed_path in sorted(set(installed.values())):
-            full_installed_path = os.path.join(lib_dir, installed_path)
-            if not os.path.isfile(full_installed_path):
-                continue
-            if not full_installed_path.endswith('.py'):
-                continue
-            yield full_installed_path
-
-    def pyc_output_path(path):
-        # type: (str) -> str
-        """Return the path the pyc file would have been written to.
+    def skip_entry(self, arcname):
         """
-        return importlib.util.cache_from_source(path)
+        Determine whether an archive entry should be skipped when verifying
+        or installing.
+        """
+        # The signature file won't be in RECORD,
+        # and we  don't currently don't do anything with it
+        # We also skip directories, as they won't be in RECORD
+        # either. See:
+        #
+        # https://github.com/pypa/wheel/issues/294
+        # https://github.com/pypa/wheel/issues/287
+        # https://github.com/pypa/wheel/pull/289
+        #
+        return arcname.endswith(('/', '/RECORD.jws'))
 
-    # Compile all of the pyc files for the installed files
-    if pycompile:
-        with captured_stdout() as stdout:
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore')
-                for path in pyc_source_file_paths():
-                    # Python 2's `compileall.compile_file` requires a str in
-                    # error cases, so we must convert to the native type.
-                    path_arg = ensure_str(
-                        path, encoding=sys.getfilesystemencoding()
-                    )
-                    success = compileall.compile_file(
-                        path_arg, force=True, quiet=True
-                    )
-                    if success:
-                        pyc_path = pyc_output_path(path)
-                        assert os.path.exists(pyc_path)
-                        pyc_record_path = cast(
-                            "RecordPath", pyc_path.replace(os.path.sep, "/")
-                        )
-                        record_installed(pyc_record_path, pyc_path)
-        logger.debug(stdout.getvalue())
+    def install(self, paths, maker, **kwargs):
+        """
+        Install a wheel to the specified paths. If kwarg ``warner`` is
+        specified, it should be a callable, which will be called with two
+        tuples indicating the wheel version of this software and the wheel
+        version in the file, if there is a discrepancy in the versions.
+        This can be used to issue any warnings to raise any exceptions.
+        If kwarg ``lib_only`` is True, only the purelib/platlib files are
+        installed, and the headers, scripts, data and dist-info metadata are
+        not written. If kwarg ``bytecode_hashed_invalidation`` is True, written
+        bytecode will try to use file-hash based invalidation (PEP-552) on
+        supported interpreter versions (CPython 2.7+).
 
-    maker = PipScriptMaker(None, scheme.scripts)
+        The return value is a :class:`InstalledDistribution` instance unless
+        ``options.lib_only`` is True, in which case the return value is ``None``.
+        """
 
-    # Ensure old scripts are overwritten.
-    # See https://github.com/pypa/pip/issues/1800
-    maker.clobber = True
+        dry_run = maker.dry_run
+        warner = kwargs.get('warner')
+        lib_only = kwargs.get('lib_only', False)
+        bc_hashed_invalidation = kwargs.get('bytecode_hashed_invalidation', False)
 
-    # Ensure we don't generate any variants for scripts because this is almost
-    # never what somebody wants.
-    # See https://bitbucket.org/pypa/distlib/issue/35/
-    maker.variants = {''}
+        pathname = os.path.join(self.dirname, self.filename)
+        name_ver = '%s-%s' % (self.name, self.version)
+        data_dir = '%s.data' % name_ver
+        info_dir = '%s.dist-info' % name_ver
 
-    # This is required because otherwise distlib creates scripts that are not
-    # executable.
-    # See https://bitbucket.org/pypa/distlib/issue/32/
-    maker.set_mode = True
+        metadata_name = posixpath.join(info_dir, LEGACY_METADATA_FILENAME)
+        wheel_metadata_name = posixpath.join(info_dir, 'WHEEL')
+        record_name = posixpath.join(info_dir, 'RECORD')
 
-    # Generate the console and GUI entry points specified in the wheel
-    scripts_to_generate = get_console_script_specs(console)
+        wrapper = codecs.getreader('utf-8')
 
-    gui_scripts_to_generate = list(starmap('{} = {}'.format, gui.items()))
+        with ZipFile(pathname, 'r') as zf:
+            with zf.open(wheel_metadata_name) as bwf:
+                wf = wrapper(bwf)
+                message = message_from_file(wf)
+            wv = message['Wheel-Version'].split('.', 1)
+            file_version = tuple([int(i) for i in wv])
+            if (file_version != self.wheel_version) and warner:
+                warner(self.wheel_version, file_version)
 
-    generated_console_scripts = maker.make_multiple(scripts_to_generate)
-    generated.extend(generated_console_scripts)
+            if message['Root-Is-Purelib'] == 'true':
+                libdir = paths['purelib']
+            else:
+                libdir = paths['platlib']
 
-    generated.extend(
-        maker.make_multiple(gui_scripts_to_generate, {'gui': True})
-    )
+            records = {}
+            with zf.open(record_name) as bf:
+                with CSVReader(stream=bf) as reader:
+                    for row in reader:
+                        p = row[0]
+                        records[p] = row
 
-    if warn_script_location:
-        msg = message_about_scripts_not_on_PATH(generated_console_scripts)
-        if msg is not None:
-            logger.warning(msg)
+            data_pfx = posixpath.join(data_dir, '')
+            info_pfx = posixpath.join(info_dir, '')
+            script_pfx = posixpath.join(data_dir, 'scripts', '')
 
-    generated_file_mode = 0o666 & ~current_umask()
+            # make a new instance rather than a copy of maker's,
+            # as we mutate it
+            fileop = FileOperator(dry_run=dry_run)
+            fileop.record = True    # so we can rollback if needed
 
-    @contextlib.contextmanager
-    def _generate_file(path, **kwargs):
-        # type: (str, **Any) -> Iterator[BinaryIO]
-        with adjacent_tmp_file(path, **kwargs) as f:
-            yield f
-        os.chmod(f.name, generated_file_mode)
-        replace(f.name, path)
+            bc = not sys.dont_write_bytecode    # Double negatives. Lovely!
 
-    dest_info_dir = os.path.join(lib_dir, info_dir)
+            outfiles = []   # for RECORD writing
 
-    # Record pip as the installer
-    installer_path = os.path.join(dest_info_dir, 'INSTALLER')
-    with _generate_file(installer_path) as installer_file:
-        installer_file.write(b'pip\n')
-    generated.append(installer_path)
+            # for script copying/shebang processing
+            workdir = tempfile.mkdtemp()
+            # set target dir later
+            # we default add_launchers to False, as the
+            # Python Launcher should be used instead
+            maker.source_dir = workdir
+            maker.target_dir = None
+            try:
+                for zinfo in zf.infolist():
+                    arcname = zinfo.filename
+                    if isinstance(arcname, text_type):
+                        u_arcname = arcname
+                    else:
+                        u_arcname = arcname.decode('utf-8')
+                    if self.skip_entry(u_arcname):
+                        continue
+                    row = records[u_arcname]
+                    if row[2] and str(zinfo.file_size) != row[2]:
+                        raise DistlibException('size mismatch for '
+                                               '%s' % u_arcname)
+                    if row[1]:
+                        kind, value = row[1].split('=', 1)
+                        with zf.open(arcname) as bf:
+                            data = bf.read()
+                        _, digest = self.get_hash(data, kind)
+                        if digest != value:
+                            raise DistlibException('digest mismatch for '
+                                                   '%s' % arcname)
 
-    # Record the PEP 610 direct URL reference
-    if direct_url is not None:
-        direct_url_path = os.path.join(dest_info_dir, DIRECT_URL_METADATA_NAME)
-        with _generate_file(direct_url_path) as direct_url_file:
-            direct_url_file.write(direct_url.to_json().encode("utf-8"))
-        generated.append(direct_url_path)
+                    if lib_only and u_arcname.startswith((info_pfx, data_pfx)):
+                        logger.debug('lib_only: skipping %s', u_arcname)
+                        continue
+                    is_script = (u_arcname.startswith(script_pfx)
+                                 and not u_arcname.endswith('.exe'))
 
-    # Record the REQUESTED file
-    if requested:
-        requested_path = os.path.join(dest_info_dir, 'REQUESTED')
-        with open(requested_path, "wb"):
-            pass
-        generated.append(requested_path)
+                    if u_arcname.startswith(data_pfx):
+                        _, where, rp = u_arcname.split('/', 2)
+                        outfile = os.path.join(paths[where], convert_path(rp))
+                    else:
+                        # meant for site-packages.
+                        if u_arcname in (wheel_metadata_name, record_name):
+                            continue
+                        outfile = os.path.join(libdir, convert_path(u_arcname))
+                    if not is_script:
+                        with zf.open(arcname) as bf:
+                            fileop.copy_stream(bf, outfile)
+                        outfiles.append(outfile)
+                        # Double check the digest of the written file
+                        if not dry_run and row[1]:
+                            with open(outfile, 'rb') as bf:
+                                data = bf.read()
+                                _, newdigest = self.get_hash(data, kind)
+                                if newdigest != digest:
+                                    raise DistlibException('digest mismatch '
+                                                           'on write for '
+                                                           '%s' % outfile)
+                        if bc and outfile.endswith('.py'):
+                            try:
+                                pyc = fileop.byte_compile(outfile,
+                                                          hashed_invalidation=bc_hashed_invalidation)
+                                outfiles.append(pyc)
+                            except Exception:
+                                # Don't give up if byte-compilation fails,
+                                # but log it and perhaps warn the user
+                                logger.warning('Byte-compilation failed',
+                                               exc_info=True)
+                    else:
+                        fn = os.path.basename(convert_path(arcname))
+                        workname = os.path.join(workdir, fn)
+                        with zf.open(arcname) as bf:
+                            fileop.copy_stream(bf, workname)
 
-    record_text = distribution.get_metadata('RECORD')
-    record_rows = list(csv.reader(record_text.splitlines()))
+                        dn, fn = os.path.split(outfile)
+                        maker.target_dir = dn
+                        filenames = maker.make(fn)
+                        fileop.set_executable_mode(filenames)
+                        outfiles.extend(filenames)
 
-    rows = get_csv_rows_for_installed(
-        record_rows,
-        installed=installed,
-        changed=changed,
-        generated=generated,
-        lib_dir=lib_dir)
+                if lib_only:
+                    logger.debug('lib_only: returning None')
+                    dist = None
+                else:
+                    # Generate scripts
 
-    # Record details of all files installed
-    record_path = os.path.join(dest_info_dir, 'RECORD')
+                    # Try to get pydist.json so we can see if there are
+                    # any commands to generate. If this fails (e.g. because
+                    # of a legacy wheel), log a warning but don't give up.
+                    commands = None
+                    file_version = self.info['Wheel-Version']
+                    if file_version == '1.0':
+                        # Use legacy info
+                        ep = posixpath.join(info_dir, 'entry_points.txt')
+                        try:
+                            with zf.open(ep) as bwf:
+                                epdata = read_exports(bwf)
+                            commands = {}
+                            for key in ('console', 'gui'):
+                                k = '%s_scripts' % key
+                                if k in epdata:
+                                    commands['wrap_%s' % key] = d = {}
+                                    for v in epdata[k].values():
+                                        s = '%s:%s' % (v.prefix, v.suffix)
+                                        if v.flags:
+                                            s += ' [%s]' % ','.join(v.flags)
+                                        d[v.name] = s
+                        except Exception:
+                            logger.warning('Unable to read legacy script '
+                                           'metadata, so cannot generate '
+                                           'scripts')
+                    else:
+                        try:
+                            with zf.open(metadata_name) as bwf:
+                                wf = wrapper(bwf)
+                                commands = json.load(wf).get('extensions')
+                                if commands:
+                                    commands = commands.get('python.commands')
+                        except Exception:
+                            logger.warning('Unable to read JSON metadata, so '
+                                           'cannot generate scripts')
+                    if commands:
+                        console_scripts = commands.get('wrap_console', {})
+                        gui_scripts = commands.get('wrap_gui', {})
+                        if console_scripts or gui_scripts:
+                            script_dir = paths.get('scripts', '')
+                            if not os.path.isdir(script_dir):
+                                raise ValueError('Valid script path not '
+                                                 'specified')
+                            maker.target_dir = script_dir
+                            for k, v in console_scripts.items():
+                                script = '%s = %s' % (k, v)
+                                filenames = maker.make(script)
+                                fileop.set_executable_mode(filenames)
 
-    with _generate_file(record_path, **csv_io_kwargs('w')) as record_file:
-        # The type mypy infers for record_file is different for Python 3
-        # (typing.IO[Any]) and Python 2 (typing.BinaryIO). We explicitly
-        # cast to typing.IO[str] as a workaround.
-        writer = csv.writer(cast('IO[str]', record_file))
-        writer.writerows(_normalized_outrows(rows))
+                            if gui_scripts:
+                                options = {'gui': True }
+                                for k, v in gui_scripts.items():
+                                    script = '%s = %s' % (k, v)
+                                    filenames = maker.make(script, options)
+                                    fileop.set_executable_mode(filenames)
+
+                    p = os.path.join(libdir, info_dir)
+                    dist = InstalledDistribution(p)
+
+                    # Write SHARED
+                    paths = dict(paths)     # don't change passed in dict
+                    del paths['purelib']
+                    del paths['platlib']
+                    paths['lib'] = libdir
+                    p = dist.write_shared_locations(paths, dry_run)
+                    if p:
+                        outfiles.append(p)
+
+                    # Write RECORD
+                    dist.write_installed_files(outfiles, paths['prefix'],
+                                               dry_run)
+                return dist
+            except Exception:  # pragma: no cover
+                logger.exception('installation failed.')
+                fileop.rollback()
+                raise
+            finally:
+                shutil.rmtree(workdir)
+
+    def _get_dylib_cache(self):
+        global cache
+        if cache is None:
+            # Use native string to avoid issues on 2.x: see Python #20140.
+            base = os.path.join(get_cache_base(), str('dylib-cache'),
+                                '%s.%s' % sys.version_info[:2])
+            cache = Cache(base)
+        return cache
+
+    def _get_extensions(self):
+        pathname = os.path.join(self.dirname, self.filename)
+        name_ver = '%s-%s' % (self.name, self.version)
+        info_dir = '%s.dist-info' % name_ver
+        arcname = posixpath.join(info_dir, 'EXTENSIONS')
+        wrapper = codecs.getreader('utf-8')
+        result = []
+        with ZipFile(pathname, 'r') as zf:
+            try:
+                with zf.open(arcname) as bf:
+                    wf = wrapper(bf)
+                    extensions = json.load(wf)
+                    cache = self._get_dylib_cache()
+                    prefix = cache.prefix_to_dir(pathname)
+                    cache_base = os.path.join(cache.base, prefix)
+                    if not os.path.isdir(cache_base):
+                        os.makedirs(cache_base)
+                    for name, relpath in extensions.items():
+                        dest = os.path.join(cache_base, convert_path(relpath))
+                        if not os.path.exists(dest):
+                            extract = True
+                        else:
+                            file_time = os.stat(dest).st_mtime
+                            file_time = datetime.datetime.fromtimestamp(file_time)
+                            info = zf.getinfo(relpath)
+                            wheel_time = datetime.datetime(*info.date_time)
+                            extract = wheel_time > file_time
+                        if extract:
+                            zf.extract(relpath, cache_base)
+                        result.append((name, dest))
+            except KeyError:
+                pass
+        return result
+
+    def is_compatible(self):
+        """
+        Determine if a wheel is compatible with the running system.
+        """
+        return is_compatible(self)
+
+    def is_mountable(self):
+        """
+        Determine if a wheel is asserted as mountable by its metadata.
+        """
+        return True # for now - metadata details TBD
+
+    def mount(self, append=False):
+        pathname = os.path.abspath(os.path.join(self.dirname, self.filename))
+        if not self.is_compatible():
+            msg = 'Wheel %s not compatible with this Python.' % pathname
+            raise DistlibException(msg)
+        if not self.is_mountable():
+            msg = 'Wheel %s is marked as not mountable.' % pathname
+            raise DistlibException(msg)
+        if pathname in sys.path:
+            logger.debug('%s already in path', pathname)
+        else:
+            if append:
+                sys.path.append(pathname)
+            else:
+                sys.path.insert(0, pathname)
+            extensions = self._get_extensions()
+            if extensions:
+                if _hook not in sys.meta_path:
+                    sys.meta_path.append(_hook)
+                _hook.add(pathname, extensions)
+
+    def unmount(self):
+        pathname = os.path.abspath(os.path.join(self.dirname, self.filename))
+        if pathname not in sys.path:
+            logger.debug('%s not in path', pathname)
+        else:
+            sys.path.remove(pathname)
+            if pathname in _hook.impure_wheels:
+                _hook.remove(pathname)
+            if not _hook.impure_wheels:
+                if _hook in sys.meta_path:
+                    sys.meta_path.remove(_hook)
+
+    def verify(self):
+        pathname = os.path.join(self.dirname, self.filename)
+        name_ver = '%s-%s' % (self.name, self.version)
+        data_dir = '%s.data' % name_ver
+        info_dir = '%s.dist-info' % name_ver
+
+        metadata_name = posixpath.join(info_dir, LEGACY_METADATA_FILENAME)
+        wheel_metadata_name = posixpath.join(info_dir, 'WHEEL')
+        record_name = posixpath.join(info_dir, 'RECORD')
+
+        wrapper = codecs.getreader('utf-8')
+
+        with ZipFile(pathname, 'r') as zf:
+            with zf.open(wheel_metadata_name) as bwf:
+                wf = wrapper(bwf)
+                message = message_from_file(wf)
+            wv = message['Wheel-Version'].split('.', 1)
+            file_version = tuple([int(i) for i in wv])
+            # TODO version verification
+
+            records = {}
+            with zf.open(record_name) as bf:
+                with CSVReader(stream=bf) as reader:
+                    for row in reader:
+                        p = row[0]
+                        records[p] = row
+
+            for zinfo in zf.infolist():
+                arcname = zinfo.filename
+                if isinstance(arcname, text_type):
+                    u_arcname = arcname
+                else:
+                    u_arcname = arcname.decode('utf-8')
+                # See issue #115: some wheels have .. in their entries, but
+                # in the filename ... e.g. __main__..py ! So the check is
+                # updated to look for .. in the directory portions
+                p = u_arcname.split('/')
+                if '..' in p:
+                    raise DistlibException('invalid entry in '
+                                           'wheel: %r' % u_arcname)
+
+                if self.skip_entry(u_arcname):
+                    continue
+                row = records[u_arcname]
+                if row[2] and str(zinfo.file_size) != row[2]:
+                    raise DistlibException('size mismatch for '
+                                           '%s' % u_arcname)
+                if row[1]:
+                    kind, value = row[1].split('=', 1)
+                    with zf.open(arcname) as bf:
+                        data = bf.read()
+                    _, digest = self.get_hash(data, kind)
+                    if digest != value:
+                        raise DistlibException('digest mismatch for '
+                                               '%s' % arcname)
+
+    def update(self, modifier, dest_dir=None, **kwargs):
+        """
+        Update the contents of a wheel in a generic way. The modifier should
+        be a callable which expects a dictionary argument: its keys are
+        archive-entry paths, and its values are absolute filesystem paths
+        where the contents the corresponding archive entries can be found. The
+        modifier is free to change the contents of the files pointed to, add
+        new entries and remove entries, before returning. This method will
+        extract the entire contents of the wheel to a temporary location, call
+        the modifier, and then use the passed (and possibly updated)
+        dictionary to write a new wheel. If ``dest_dir`` is specified, the new
+        wheel is written there -- otherwise, the original wheel is overwritten.
+
+        The modifier should return True if it updated the wheel, else False.
+        This method returns the same value the modifier returns.
+        """
+
+        def get_version(path_map, info_dir):
+            version = path = None
+            key = '%s/%s' % (info_dir, LEGACY_METADATA_FILENAME)
+            if key not in path_map:
+                key = '%s/PKG-INFO' % info_dir
+            if key in path_map:
+                path = path_map[key]
+                version = Metadata(path=path).version
+            return version, path
+
+        def update_version(version, path):
+            updated = None
+            try:
+                v = NormalizedVersion(version)
+                i = version.find('-')
+                if i < 0:
+                    updated = '%s+1' % version
+                else:
+                    parts = [int(s) for s in version[i + 1:].split('.')]
+                    parts[-1] += 1
+                    updated = '%s+%s' % (version[:i],
+                                         '.'.join(str(i) for i in parts))
+            except UnsupportedVersionError:
+                logger.debug('Cannot update non-compliant (PEP-440) '
+                             'version %r', version)
+            if updated:
+                md = Metadata(path=path)
+                md.version = updated
+                legacy = path.endswith(LEGACY_METADATA_FILENAME)
+                md.write(path=path, legacy=legacy)
+                logger.debug('Version updated from %r to %r', version,
+                             updated)
+
+        pathname = os.path.join(self.dirname, self.filename)
+        name_ver = '%s-%s' % (self.name, self.version)
+        info_dir = '%s.dist-info' % name_ver
+        record_name = posixpath.join(info_dir, 'RECORD')
+        with tempdir() as workdir:
+            with ZipFile(pathname, 'r') as zf:
+                path_map = {}
+                for zinfo in zf.infolist():
+                    arcname = zinfo.filename
+                    if isinstance(arcname, text_type):
+                        u_arcname = arcname
+                    else:
+                        u_arcname = arcname.decode('utf-8')
+                    if u_arcname == record_name:
+                        continue
+                    if '..' in u_arcname:
+                        raise DistlibException('invalid entry in '
+                                               'wheel: %r' % u_arcname)
+                    zf.extract(zinfo, workdir)
+                    path = os.path.join(workdir, convert_path(u_arcname))
+                    path_map[u_arcname] = path
+
+            # Remember the version.
+            original_version, _ = get_version(path_map, info_dir)
+            # Files extracted. Call the modifier.
+            modified = modifier(path_map, **kwargs)
+            if modified:
+                # Something changed - need to build a new wheel.
+                current_version, path = get_version(path_map, info_dir)
+                if current_version and (current_version == original_version):
+                    # Add or update local version to signify changes.
+                    update_version(current_version, path)
+                # Decide where the new wheel goes.
+                if dest_dir is None:
+                    fd, newpath = tempfile.mkstemp(suffix='.whl',
+                                                   prefix='wheel-update-',
+                                                   dir=workdir)
+                    os.close(fd)
+                else:
+                    if not os.path.isdir(dest_dir):
+                        raise DistlibException('Not a directory: %r' % dest_dir)
+                    newpath = os.path.join(dest_dir, self.filename)
+                archive_paths = list(path_map.items())
+                distinfo = os.path.join(workdir, info_dir)
+                info = distinfo, info_dir
+                self.write_records(info, workdir, archive_paths)
+                self.build_zip(newpath, archive_paths)
+                if dest_dir is None:
+                    shutil.copyfile(newpath, pathname)
+        return modified
+
+def compatible_tags():
+    """
+    Return (pyver, abi, arch) tuples compatible with this Python.
+    """
+    versions = [VER_SUFFIX]
+    major = VER_SUFFIX[0]
+    for minor in range(sys.version_info[1] - 1, - 1, -1):
+        versions.append(''.join([major, str(minor)]))
+
+    abis = []
+    for suffix, _, _ in imp.get_suffixes():
+        if suffix.startswith('.abi'):
+            abis.append(suffix.split('.', 2)[1])
+    abis.sort()
+    if ABI != 'none':
+        abis.insert(0, ABI)
+    abis.append('none')
+    result = []
+
+    arches = [ARCH]
+    if sys.platform == 'darwin':
+        m = re.match(r'(\w+)_(\d+)_(\d+)_(\w+)$', ARCH)
+        if m:
+            name, major, minor, arch = m.groups()
+            minor = int(minor)
+            matches = [arch]
+            if arch in ('i386', 'ppc'):
+                matches.append('fat')
+            if arch in ('i386', 'ppc', 'x86_64'):
+                matches.append('fat3')
+            if arch in ('ppc64', 'x86_64'):
+                matches.append('fat64')
+            if arch in ('i386', 'x86_64'):
+                matches.append('intel')
+            if arch in ('i386', 'x86_64', 'intel', 'ppc', 'ppc64'):
+                matches.append('universal')
+            while minor >= 0:
+                for match in matches:
+                    s = '%s_%s_%s_%s' % (name, major, minor, match)
+                    if s != ARCH:   # already there
+                        arches.append(s)
+                minor -= 1
+
+    # Most specific - our Python version, ABI and arch
+    for abi in abis:
+        for arch in arches:
+            result.append((''.join((IMP_PREFIX, versions[0])), abi, arch))
+
+    # where no ABI / arch dependency, but IMP_PREFIX dependency
+    for i, version in enumerate(versions):
+        result.append((''.join((IMP_PREFIX, version)), 'none', 'any'))
+        if i == 0:
+            result.append((''.join((IMP_PREFIX, version[0])), 'none', 'any'))
+
+    # no IMP_PREFIX, ABI or arch dependency
+    for i, version in enumerate(versions):
+        result.append((''.join(('py', version)), 'none', 'any'))
+        if i == 0:
+            result.append((''.join(('py', version[0])), 'none', 'any'))
+    return set(result)
 
 
-@contextlib.contextmanager
-def req_error_context(req_description):
-    # type: (str) -> Iterator[None]
-    try:
-        yield
-    except InstallationError as e:
-        message = "For req: {}. {}".format(req_description, e.args[0])
-        reraise(
-            InstallationError, InstallationError(message), sys.exc_info()[2]
-        )
+COMPATIBLE_TAGS = compatible_tags()
+
+del compatible_tags
 
 
-def install_wheel(
-    name,  # type: str
-    wheel_path,  # type: str
-    scheme,  # type: Scheme
-    req_description,  # type: str
-    pycompile=True,  # type: bool
-    warn_script_location=True,  # type: bool
-    direct_url=None,  # type: Optional[DirectUrl]
-    requested=False,  # type: bool
-):
-    # type: (...) -> None
-    with ZipFile(wheel_path, allowZip64=True) as z:
-        with req_error_context(req_description):
-            _install_wheel(
-                name=name,
-                wheel_zip=z,
-                wheel_path=wheel_path,
-                scheme=scheme,
-                pycompile=pycompile,
-                warn_script_location=warn_script_location,
-                direct_url=direct_url,
-                requested=requested,
-            )
+def is_compatible(wheel, tags=None):
+    if not isinstance(wheel, Wheel):
+        wheel = Wheel(wheel)    # assume it's a filename
+    result = False
+    if tags is None:
+        tags = COMPATIBLE_TAGS
+    for ver, abi, arch in tags:
+        if ver in wheel.pyver and abi in wheel.abi and arch in wheel.arch:
+            result = True
+            break
+    return result
