@@ -1,88 +1,154 @@
-"""A collection of modules for building different kinds of trees from HTML
-documents.
+"""A collection of modules for iterating through different kinds of
+tree, generating tokens identical to those produced by the tokenizer
+module.
 
-To create a treebuilder for a new type of tree, you need to do
-implement several things:
-
-1. A set of classes for various types of elements: Document, Doctype, Comment,
-   Element. These must implement the interface of ``base.treebuilders.Node``
-   (although comment nodes have a different signature for their constructor,
-   see ``treebuilders.etree.Comment``) Textual content may also be implemented
-   as another node type, or not, as your tree implementation requires.
-
-2. A treebuilder object (called ``TreeBuilder`` by convention) that inherits
-   from ``treebuilders.base.TreeBuilder``. This has 4 required attributes:
-
-   * ``documentClass`` - the class to use for the bottommost node of a document
-   * ``elementClass`` - the class to use for HTML Elements
-   * ``commentClass`` - the class to use for comments
-   * ``doctypeClass`` - the class to use for doctypes
-
-   It also has one required method:
-
-   * ``getDocument`` - Returns the root node of the complete document tree
-
-3. If you wish to run the unit tests, you must also create a ``testSerializer``
-   method on your treebuilder which accepts a node and returns a string
-   containing Node and its children serialized according to the format used in
-   the unittests
-
+To create a tree walker for a new type of tree, you need to
+implement a tree walker object (called TreeWalker by convention) that
+implements a 'serialize' method which takes a tree as sole argument and
+returns an iterator which generates tokens.
 """
 
 from __future__ import absolute_import, division, unicode_literals
 
+from .. import constants
 from .._utils import default_etree
 
-treeBuilderCache = {}
+__all__ = ["getTreeWalker", "pprint"]
+
+treeWalkerCache = {}
 
 
-def getTreeBuilder(treeType, implementation=None, **kwargs):
-    """Get a TreeBuilder class for various types of trees with built-in support
+def getTreeWalker(treeType, implementation=None, **kwargs):
+    """Get a TreeWalker class for various types of tree with built-in support
 
-    :arg treeType: the name of the tree type required (case-insensitive). Supported
-        values are:
+    :arg str treeType: the name of the tree type required (case-insensitive).
+        Supported values are:
 
-        * "dom" - A generic builder for DOM implementations, defaulting to a
-          xml.dom.minidom based implementation.
-        * "etree" - A generic builder for tree implementations exposing an
-          ElementTree-like interface, defaulting to xml.etree.cElementTree if
-          available and xml.etree.ElementTree if not.
-        * "lxml" - A etree-based builder for lxml.etree, handling limitations
-          of lxml's implementation.
+        * "dom": The xml.dom.minidom DOM implementation
+        * "etree": A generic walker for tree implementations exposing an
+          elementtree-like interface (known to work with ElementTree,
+          cElementTree and lxml.etree).
+        * "lxml": Optimized walker for lxml.etree
+        * "genshi": a Genshi stream
 
-    :arg implementation: (Currently applies to the "etree" and "dom" tree
-        types). A module implementing the tree type e.g. xml.etree.ElementTree
-        or xml.etree.cElementTree.
+    :arg implementation: A module implementing the tree type e.g.
+        xml.etree.ElementTree or cElementTree (Currently applies to the "etree"
+        tree type only).
 
-    :arg kwargs: Any additional options to pass to the TreeBuilder when
-        creating it.
+    :arg kwargs: keyword arguments passed to the etree walker--for other
+        walkers, this has no effect
 
-    Example:
-
-    >>> from html5lib.treebuilders import getTreeBuilder
-    >>> builder = getTreeBuilder('etree')
+    :returns: a TreeWalker class
 
     """
 
     treeType = treeType.lower()
-    if treeType not in treeBuilderCache:
+    if treeType not in treeWalkerCache:
         if treeType == "dom":
             from . import dom
-            # Come up with a sane default (pref. from the stdlib)
-            if implementation is None:
-                from xml.dom import minidom
-                implementation = minidom
-            # NEVER cache here, caching is done in the dom submodule
-            return dom.getDomModule(implementation, **kwargs).TreeBuilder
+            treeWalkerCache[treeType] = dom.TreeWalker
+        elif treeType == "genshi":
+            from . import genshi
+            treeWalkerCache[treeType] = genshi.TreeWalker
         elif treeType == "lxml":
             from . import etree_lxml
-            treeBuilderCache[treeType] = etree_lxml.TreeBuilder
+            treeWalkerCache[treeType] = etree_lxml.TreeWalker
         elif treeType == "etree":
             from . import etree
             if implementation is None:
                 implementation = default_etree
-            # NEVER cache here, caching is done in the etree submodule
-            return etree.getETreeModule(implementation, **kwargs).TreeBuilder
+            # XXX: NEVER cache here, caching is done in the etree submodule
+            return etree.getETreeModule(implementation, **kwargs).TreeWalker
+    return treeWalkerCache.get(treeType)
+
+
+def concatenateCharacterTokens(tokens):
+    pendingCharacters = []
+    for token in tokens:
+        type = token["type"]
+        if type in ("Characters", "SpaceCharacters"):
+            pendingCharacters.append(token["data"])
         else:
-            raise ValueError("""Unrecognised treebuilder "%s" """ % treeType)
-    return treeBuilderCache.get(treeType)
+            if pendingCharacters:
+                yield {"type": "Characters", "data": "".join(pendingCharacters)}
+                pendingCharacters = []
+            yield token
+    if pendingCharacters:
+        yield {"type": "Characters", "data": "".join(pendingCharacters)}
+
+
+def pprint(walker):
+    """Pretty printer for tree walkers
+
+    Takes a TreeWalker instance and pretty prints the output of walking the tree.
+
+    :arg walker: a TreeWalker instance
+
+    """
+    output = []
+    indent = 0
+    for token in concatenateCharacterTokens(walker):
+        type = token["type"]
+        if type in ("StartTag", "EmptyTag"):
+            # tag name
+            if token["namespace"] and token["namespace"] != constants.namespaces["html"]:
+                if token["namespace"] in constants.prefixes:
+                    ns = constants.prefixes[token["namespace"]]
+                else:
+                    ns = token["namespace"]
+                name = "%s %s" % (ns, token["name"])
+            else:
+                name = token["name"]
+            output.append("%s<%s>" % (" " * indent, name))
+            indent += 2
+            # attributes (sorted for consistent ordering)
+            attrs = token["data"]
+            for (namespace, localname), value in sorted(attrs.items()):
+                if namespace:
+                    if namespace in constants.prefixes:
+                        ns = constants.prefixes[namespace]
+                    else:
+                        ns = namespace
+                    name = "%s %s" % (ns, localname)
+                else:
+                    name = localname
+                output.append("%s%s=\"%s\"" % (" " * indent, name, value))
+            # self-closing
+            if type == "EmptyTag":
+                indent -= 2
+
+        elif type == "EndTag":
+            indent -= 2
+
+        elif type == "Comment":
+            output.append("%s<!-- %s -->" % (" " * indent, token["data"]))
+
+        elif type == "Doctype":
+            if token["name"]:
+                if token["publicId"]:
+                    output.append("""%s<!DOCTYPE %s "%s" "%s">""" %
+                                  (" " * indent,
+                                   token["name"],
+                                   token["publicId"],
+                                   token["systemId"] if token["systemId"] else ""))
+                elif token["systemId"]:
+                    output.append("""%s<!DOCTYPE %s "" "%s">""" %
+                                  (" " * indent,
+                                   token["name"],
+                                   token["systemId"]))
+                else:
+                    output.append("%s<!DOCTYPE %s>" % (" " * indent,
+                                                       token["name"]))
+            else:
+                output.append("%s<!DOCTYPE >" % (" " * indent,))
+
+        elif type == "Characters":
+            output.append("%s\"%s\"" % (" " * indent, token["data"]))
+
+        elif type == "SpaceCharacters":
+            assert False, "concatenateCharacterTokens should have got rid of all Space tokens"
+
+        else:
+            raise ValueError("Unknown token type, %s" % type)
+
+    return "\n".join(output)

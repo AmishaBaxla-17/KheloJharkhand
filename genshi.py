@@ -1,54 +1,69 @@
 from __future__ import absolute_import, division, unicode_literals
 
-from genshi.core import QName, Attrs
-from genshi.core import START, END, TEXT, COMMENT, DOCTYPE
+from genshi.core import QName
+from genshi.core import START, END, XML_NAMESPACE, DOCTYPE, TEXT
+from genshi.core import START_NS, END_NS, START_CDATA, END_CDATA, PI, COMMENT
+
+from . import base
+
+from ..constants import voidElements, namespaces
 
 
-def to_genshi(walker):
-    """Convert a tree to a genshi tree
+class TreeWalker(base.TreeWalker):
+    def __iter__(self):
+        # Buffer the events so we can pass in the following one
+        previous = None
+        for event in self.tree:
+            if previous is not None:
+                for token in self.tokens(previous, event):
+                    yield token
+            previous = event
 
-    :arg walker: the treewalker to use to walk the tree to convert it
+        # Don't forget the final event!
+        if previous is not None:
+            for token in self.tokens(previous, None):
+                yield token
 
-    :returns: generator of genshi nodes
+    def tokens(self, event, next):
+        kind, data, _ = event
+        if kind == START:
+            tag, attribs = data
+            name = tag.localname
+            namespace = tag.namespace
+            converted_attribs = {}
+            for k, v in attribs:
+                if isinstance(k, QName):
+                    converted_attribs[(k.namespace, k.localname)] = v
+                else:
+                    converted_attribs[(None, k)] = v
 
-    """
-    text = []
-    for token in walker:
-        type = token["type"]
-        if type in ("Characters", "SpaceCharacters"):
-            text.append(token["data"])
-        elif text:
-            yield TEXT, "".join(text), (None, -1, -1)
-            text = []
-
-        if type in ("StartTag", "EmptyTag"):
-            if token["namespace"]:
-                name = "{%s}%s" % (token["namespace"], token["name"])
+            if namespace == namespaces["html"] and name in voidElements:
+                for token in self.emptyTag(namespace, name, converted_attribs,
+                                           not next or next[0] != END or
+                                           next[1] != tag):
+                    yield token
             else:
-                name = token["name"]
-            attrs = Attrs([(QName("{%s}%s" % attr if attr[0] is not None else attr[1]), value)
-                           for attr, value in token["data"].items()])
-            yield (START, (QName(name), attrs), (None, -1, -1))
-            if type == "EmptyTag":
-                type = "EndTag"
+                yield self.startTag(namespace, name, converted_attribs)
 
-        if type == "EndTag":
-            if token["namespace"]:
-                name = "{%s}%s" % (token["namespace"], token["name"])
-            else:
-                name = token["name"]
+        elif kind == END:
+            name = data.localname
+            namespace = data.namespace
+            if namespace != namespaces["html"] or name not in voidElements:
+                yield self.endTag(namespace, name)
 
-            yield END, QName(name), (None, -1, -1)
+        elif kind == COMMENT:
+            yield self.comment(data)
 
-        elif type == "Comment":
-            yield COMMENT, token["data"], (None, -1, -1)
+        elif kind == TEXT:
+            for token in self.text(data):
+                yield token
 
-        elif type == "Doctype":
-            yield DOCTYPE, (token["name"], token["publicId"],
-                            token["systemId"]), (None, -1, -1)
+        elif kind == DOCTYPE:
+            yield self.doctype(*data)
+
+        elif kind in (XML_NAMESPACE, DOCTYPE, START_NS, END_NS,
+                      START_CDATA, END_CDATA, PI):
+            pass
 
         else:
-            pass  # FIXME: What to do?
-
-    if text:
-        yield TEXT, "".join(text), (None, -1, -1)
+            yield self.unknown(kind)
