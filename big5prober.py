@@ -1,7 +1,13 @@
 ######################## BEGIN LICENSE BLOCK ########################
+# The Original Code is Mozilla Communicator client code.
+#
+# The Initial Developer of the Original Code is
+# Netscape Communications Corporation.
+# Portions created by the Initial Developer are Copyright (C) 1998
+# the Initial Developer. All Rights Reserved.
+#
 # Contributor(s):
-#   Dan Blanchard
-#   Ian Cordasco
+#   Mark Pilgrim - port to Python
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -19,18 +25,23 @@
 # 02110-1301  USA
 ######################### END LICENSE BLOCK #########################
 
-import sys
+from .mbcharsetprober import MultiByteCharSetProber
+from .codingstatemachine import CodingStateMachine
+from .chardistribution import Big5DistributionAnalysis
+from .mbcssm import BIG5_SM_MODEL
 
 
-if sys.version_info < (3, 0):
-    PY2 = True
-    PY3 = False
-    string_types = (str, unicode)
-    text_type = unicode
-    iteritems = dict.iteritems
-else:
-    PY2 = False
-    PY3 = True
-    string_types = (bytes, str)
-    text_type = str
-    iteritems = dict.items
+class Big5Prober(MultiByteCharSetProber):
+    def __init__(self):
+        super(Big5Prober, self).__init__()
+        self.coding_sm = CodingStateMachine(BIG5_SM_MODEL)
+        self.distribution_analyzer = Big5DistributionAnalysis()
+        self.reset()
+
+    @property
+    def charset_name(self):
+        return "Big5"
+
+    @property
+    def language(self):
+        return "Chinese"
