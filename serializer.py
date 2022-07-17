@@ -1,295 +1,409 @@
-import json
-import typing as _t
+from __future__ import absolute_import, division, unicode_literals
+from pip._vendor.six import text_type
 
-from .encoding import want_bytes
-from .exc import BadPayload
-from .exc import BadSignature
-from .signer import _make_keys_list
-from .signer import Signer
+import re
 
-_t_str_bytes = _t.Union[str, bytes]
-_t_opt_str_bytes = _t.Optional[_t_str_bytes]
-_t_kwargs = _t.Dict[str, _t.Any]
-_t_opt_kwargs = _t.Optional[_t_kwargs]
-_t_signer = _t.Type[Signer]
-_t_fallbacks = _t.List[_t.Union[_t_kwargs, _t.Tuple[_t_signer, _t_kwargs], _t_signer]]
-_t_load_unsafe = _t.Tuple[bool, _t.Any]
-_t_secret_key = _t.Union[_t.Iterable[_t_str_bytes], _t_str_bytes]
+from codecs import register_error, xmlcharrefreplace_errors
+
+from .constants import voidElements, booleanAttributes, spaceCharacters
+from .constants import rcdataElements, entities, xmlEntities
+from . import treewalkers, _utils
+from xml.sax.saxutils import escape
+
+_quoteAttributeSpecChars = "".join(spaceCharacters) + "\"'=<>`"
+_quoteAttributeSpec = re.compile("[" + _quoteAttributeSpecChars + "]")
+_quoteAttributeLegacy = re.compile("[" + _quoteAttributeSpecChars +
+                                   "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n"
+                                   "\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15"
+                                   "\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+                                   "\x20\x2f\x60\xa0\u1680\u180e\u180f\u2000"
+                                   "\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+                                   "\u2008\u2009\u200a\u2028\u2029\u202f\u205f"
+                                   "\u3000]")
 
 
-def is_text_serializer(serializer: _t.Any) -> bool:
-    """Checks whether a serializer generates text or binary."""
-    return isinstance(serializer.dumps({}), str)
-
-
-class Serializer:
-    """A serializer wraps a :class:`~itsdangerous.signer.Signer` to
-    enable serializing and securely signing data other than bytes. It
-    can unsign to verify that the data hasn't been changed.
-
-    The serializer provides :meth:`dumps` and :meth:`loads`, similar to
-    :mod:`json`, and by default uses :mod:`json` internally to serialize
-    the data to bytes.
-
-    The secret key should be a random string of ``bytes`` and should not
-    be saved to code or version control. Different salts should be used
-    to distinguish signing in different contexts. See :doc:`/concepts`
-    for information about the security of the secret key and salt.
-
-    :param secret_key: The secret key to sign and verify with. Can be a
-        list of keys, oldest to newest, to support key rotation.
-    :param salt: Extra key to combine with ``secret_key`` to distinguish
-        signatures in different contexts.
-    :param serializer: An object that provides ``dumps`` and ``loads``
-        methods for serializing data to a string. Defaults to
-        :attr:`default_serializer`, which defaults to :mod:`json`.
-    :param serializer_kwargs: Keyword arguments to pass when calling
-        ``serializer.dumps``.
-    :param signer: A ``Signer`` class to instantiate when signing data.
-        Defaults to :attr:`default_signer`, which defaults to
-        :class:`~itsdangerous.signer.Signer`.
-    :param signer_kwargs: Keyword arguments to pass when instantiating
-        the ``Signer`` class.
-    :param fallback_signers: List of signer parameters to try when
-        unsigning with the default signer fails. Each item can be a dict
-        of ``signer_kwargs``, a ``Signer`` class, or a tuple of
-        ``(signer, signer_kwargs)``. Defaults to
-        :attr:`default_fallback_signers`.
-
-    .. versionchanged:: 2.0
-        Added support for key rotation by passing a list to
-        ``secret_key``.
-
-    .. versionchanged:: 2.0
-        Removed the default SHA-512 fallback signer from
-        ``default_fallback_signers``.
-
-    .. versionchanged:: 1.1
-        Added support for ``fallback_signers`` and configured a default
-        SHA-512 fallback. This fallback is for users who used the yanked
-        1.0.0 release which defaulted to SHA-512.
-
-    .. versionchanged:: 0.14
-        The ``signer`` and ``signer_kwargs`` parameters were added to
-        the constructor.
-    """
-
-    #: The default serialization module to use to serialize data to a
-    #: string internally. The default is :mod:`json`, but can be changed
-    #: to any object that provides ``dumps`` and ``loads`` methods.
-    default_serializer: _t.Any = json
-
-    #: The default ``Signer`` class to instantiate when signing data.
-    #: The default is :class:`itsdangerous.signer.Signer`.
-    default_signer: _t_signer = Signer
-
-    #: The default fallback signers to try when unsigning fails.
-    default_fallback_signers: _t_fallbacks = []
-
-    def __init__(
-        self,
-        secret_key: _t_secret_key,
-        salt: _t_opt_str_bytes = b"itsdangerous",
-        serializer: _t.Any = None,
-        serializer_kwargs: _t_opt_kwargs = None,
-        signer: _t.Optional[_t_signer] = None,
-        signer_kwargs: _t_opt_kwargs = None,
-        fallback_signers: _t.Optional[_t_fallbacks] = None,
-    ):
-        #: The list of secret keys to try for verifying signatures, from
-        #: oldest to newest. The newest (last) key is used for signing.
-        #:
-        #: This allows a key rotation system to keep a list of allowed
-        #: keys and remove expired ones.
-        self.secret_keys: _t.List[bytes] = _make_keys_list(secret_key)
-
-        if salt is not None:
-            salt = want_bytes(salt)
-            # if salt is None then the signer's default is used
-
-        self.salt = salt
-
-        if serializer is None:
-            serializer = self.default_serializer
-
-        self.serializer: _t.Any = serializer
-        self.is_text_serializer: bool = is_text_serializer(serializer)
-
-        if signer is None:
-            signer = self.default_signer
-
-        self.signer: _t_signer = signer
-        self.signer_kwargs: _t_kwargs = signer_kwargs or {}
-
-        if fallback_signers is None:
-            fallback_signers = list(self.default_fallback_signers or ())
-
-        self.fallback_signers: _t_fallbacks = fallback_signers
-        self.serializer_kwargs: _t_kwargs = serializer_kwargs or {}
-
-    @property
-    def secret_key(self) -> bytes:
-        """The newest (last) entry in the :attr:`secret_keys` list. This
-        is for compatibility from before key rotation support was added.
-        """
-        return self.secret_keys[-1]
-
-    def load_payload(
-        self, payload: bytes, serializer: _t.Optional[_t.Any] = None
-    ) -> _t.Any:
-        """Loads the encoded object. This function raises
-        :class:`.BadPayload` if the payload is not valid. The
-        ``serializer`` parameter can be used to override the serializer
-        stored on the class. The encoded ``payload`` should always be
-        bytes.
-        """
-        if serializer is None:
-            serializer = self.serializer
-            is_text = self.is_text_serializer
+_encode_entity_map = {}
+_is_ucs4 = len("\U0010FFFF") == 1
+for k, v in list(entities.items()):
+    # skip multi-character entities
+    if ((_is_ucs4 and len(v) > 1) or
+            (not _is_ucs4 and len(v) > 2)):
+        continue
+    if v != "&":
+        if len(v) == 2:
+            v = _utils.surrogatePairToCodepoint(v)
         else:
-            is_text = is_text_serializer(serializer)
+            v = ord(v)
+        if v not in _encode_entity_map or k.islower():
+            # prefer &lt; over &LT; and similarly for &amp;, &gt;, etc.
+            _encode_entity_map[v] = k
 
-        try:
-            if is_text:
-                return serializer.loads(payload.decode("utf-8"))
 
-            return serializer.loads(payload)
-        except Exception as e:
-            raise BadPayload(
-                "Could not load the payload because an exception"
-                " occurred on unserializing the data.",
-                original_error=e,
-            )
-
-    def dump_payload(self, obj: _t.Any) -> bytes:
-        """Dumps the encoded object. The return value is always bytes.
-        If the internal serializer returns text, the value will be
-        encoded as UTF-8.
-        """
-        return want_bytes(self.serializer.dumps(obj, **self.serializer_kwargs))
-
-    def make_signer(self, salt: _t_opt_str_bytes = None) -> Signer:
-        """Creates a new instance of the signer to be used. The default
-        implementation uses the :class:`.Signer` base class.
-        """
-        if salt is None:
-            salt = self.salt
-
-        return self.signer(self.secret_keys, salt=salt, **self.signer_kwargs)
-
-    def iter_unsigners(self, salt: _t_opt_str_bytes = None) -> _t.Iterator[Signer]:
-        """Iterates over all signers to be tried for unsigning. Starts
-        with the configured signer, then constructs each signer
-        specified in ``fallback_signers``.
-        """
-        if salt is None:
-            salt = self.salt
-
-        yield self.make_signer(salt)
-
-        for fallback in self.fallback_signers:
-            if isinstance(fallback, dict):
-                kwargs = fallback
-                fallback = self.signer
-            elif isinstance(fallback, tuple):
-                fallback, kwargs = fallback
+def htmlentityreplace_errors(exc):
+    if isinstance(exc, (UnicodeEncodeError, UnicodeTranslateError)):
+        res = []
+        codepoints = []
+        skip = False
+        for i, c in enumerate(exc.object[exc.start:exc.end]):
+            if skip:
+                skip = False
+                continue
+            index = i + exc.start
+            if _utils.isSurrogatePair(exc.object[index:min([exc.end, index + 2])]):
+                codepoint = _utils.surrogatePairToCodepoint(exc.object[index:index + 2])
+                skip = True
             else:
-                kwargs = self.signer_kwargs
+                codepoint = ord(c)
+            codepoints.append(codepoint)
+        for cp in codepoints:
+            e = _encode_entity_map.get(cp)
+            if e:
+                res.append("&")
+                res.append(e)
+                if not e.endswith(";"):
+                    res.append(";")
+            else:
+                res.append("&#x%s;" % (hex(cp)[2:]))
+        return ("".join(res), exc.end)
+    else:
+        return xmlcharrefreplace_errors(exc)
 
-            for secret_key in self.secret_keys:
-                yield fallback(secret_key, salt=salt, **kwargs)
 
-    def dumps(self, obj: _t.Any, salt: _t_opt_str_bytes = None) -> _t_str_bytes:
-        """Returns a signed string serialized with the internal
-        serializer. The return value can be either a byte or unicode
-        string depending on the format of the internal serializer.
+register_error("htmlentityreplace", htmlentityreplace_errors)
+
+
+def serialize(input, tree="etree", encoding=None, **serializer_opts):
+    """Serializes the input token stream using the specified treewalker
+
+    :arg input: the token stream to serialize
+
+    :arg tree: the treewalker to use
+
+    :arg encoding: the encoding to use
+
+    :arg serializer_opts: any options to pass to the
+        :py:class:`html5lib.serializer.HTMLSerializer` that gets created
+
+    :returns: the tree serialized as a string
+
+    Example:
+
+    >>> from html5lib.html5parser import parse
+    >>> from html5lib.serializer import serialize
+    >>> token_stream = parse('<html><body><p>Hi!</p></body></html>')
+    >>> serialize(token_stream, omit_optional_tags=False)
+    '<html><head></head><body><p>Hi!</p></body></html>'
+
+    """
+    # XXX: Should we cache this?
+    walker = treewalkers.getTreeWalker(tree)
+    s = HTMLSerializer(**serializer_opts)
+    return s.render(walker(input), encoding)
+
+
+class HTMLSerializer(object):
+
+    # attribute quoting options
+    quote_attr_values = "legacy"  # be secure by default
+    quote_char = '"'
+    use_best_quote_char = True
+
+    # tag syntax options
+    omit_optional_tags = True
+    minimize_boolean_attributes = True
+    use_trailing_solidus = False
+    space_before_trailing_solidus = True
+
+    # escaping options
+    escape_lt_in_attrs = False
+    escape_rcdata = False
+    resolve_entities = True
+
+    # miscellaneous options
+    alphabetical_attributes = False
+    inject_meta_charset = True
+    strip_whitespace = False
+    sanitize = False
+
+    options = ("quote_attr_values", "quote_char", "use_best_quote_char",
+               "omit_optional_tags", "minimize_boolean_attributes",
+               "use_trailing_solidus", "space_before_trailing_solidus",
+               "escape_lt_in_attrs", "escape_rcdata", "resolve_entities",
+               "alphabetical_attributes", "inject_meta_charset",
+               "strip_whitespace", "sanitize")
+
+    def __init__(self, **kwargs):
+        """Initialize HTMLSerializer
+
+        :arg inject_meta_charset: Whether or not to inject the meta charset.
+
+            Defaults to ``True``.
+
+        :arg quote_attr_values: Whether to quote attribute values that don't
+            require quoting per legacy browser behavior (``"legacy"``), when
+            required by the standard (``"spec"``), or always (``"always"``).
+
+            Defaults to ``"legacy"``.
+
+        :arg quote_char: Use given quote character for attribute quoting.
+
+            Defaults to ``"`` which will use double quotes unless attribute
+            value contains a double quote, in which case single quotes are
+            used.
+
+        :arg escape_lt_in_attrs: Whether or not to escape ``<`` in attribute
+            values.
+
+            Defaults to ``False``.
+
+        :arg escape_rcdata: Whether to escape characters that need to be
+            escaped within normal elements within rcdata elements such as
+            style.
+
+            Defaults to ``False``.
+
+        :arg resolve_entities: Whether to resolve named character entities that
+            appear in the source tree. The XML predefined entities &lt; &gt;
+            &amp; &quot; &apos; are unaffected by this setting.
+
+            Defaults to ``True``.
+
+        :arg strip_whitespace: Whether to remove semantically meaningless
+            whitespace. (This compresses all whitespace to a single space
+            except within ``pre``.)
+
+            Defaults to ``False``.
+
+        :arg minimize_boolean_attributes: Shortens boolean attributes to give
+            just the attribute value, for example::
+
+              <input disabled="disabled">
+
+            becomes::
+
+              <input disabled>
+
+            Defaults to ``True``.
+
+        :arg use_trailing_solidus: Includes a close-tag slash at the end of the
+            start tag of void elements (empty elements whose end tag is
+            forbidden). E.g. ``<hr/>``.
+
+            Defaults to ``False``.
+
+        :arg space_before_trailing_solidus: Places a space immediately before
+            the closing slash in a tag using a trailing solidus. E.g.
+            ``<hr />``. Requires ``use_trailing_solidus=True``.
+
+            Defaults to ``True``.
+
+        :arg sanitize: Strip all unsafe or unknown constructs from output.
+            See :py:class:`html5lib.filters.sanitizer.Filter`.
+
+            Defaults to ``False``.
+
+        :arg omit_optional_tags: Omit start/end tags that are optional.
+
+            Defaults to ``True``.
+
+        :arg alphabetical_attributes: Reorder attributes to be in alphabetical order.
+
+            Defaults to ``False``.
+
         """
-        payload = want_bytes(self.dump_payload(obj))
-        rv = self.make_signer(salt).sign(payload)
+        unexpected_args = frozenset(kwargs) - frozenset(self.options)
+        if len(unexpected_args) > 0:
+            raise TypeError("__init__() got an unexpected keyword argument '%s'" % next(iter(unexpected_args)))
+        if 'quote_char' in kwargs:
+            self.use_best_quote_char = False
+        for attr in self.options:
+            setattr(self, attr, kwargs.get(attr, getattr(self, attr)))
+        self.errors = []
+        self.strict = False
 
-        if self.is_text_serializer:
-            return rv.decode("utf-8")
+    def encode(self, string):
+        assert(isinstance(string, text_type))
+        if self.encoding:
+            return string.encode(self.encoding, "htmlentityreplace")
+        else:
+            return string
 
-        return rv
+    def encodeStrict(self, string):
+        assert(isinstance(string, text_type))
+        if self.encoding:
+            return string.encode(self.encoding, "strict")
+        else:
+            return string
 
-    def dump(self, obj: _t.Any, f: _t.IO, salt: _t_opt_str_bytes = None) -> None:
-        """Like :meth:`dumps` but dumps into a file. The file handle has
-        to be compatible with what the internal serializer expects.
+    def serialize(self, treewalker, encoding=None):
+        # pylint:disable=too-many-nested-blocks
+        self.encoding = encoding
+        in_cdata = False
+        self.errors = []
+
+        if encoding and self.inject_meta_charset:
+            from .filters.inject_meta_charset import Filter
+            treewalker = Filter(treewalker, encoding)
+        # Alphabetical attributes is here under the assumption that none of
+        # the later filters add or change order of attributes; it needs to be
+        # before the sanitizer so escaped elements come out correctly
+        if self.alphabetical_attributes:
+            from .filters.alphabeticalattributes import Filter
+            treewalker = Filter(treewalker)
+        # WhitespaceFilter should be used before OptionalTagFilter
+        # for maximum efficiently of this latter filter
+        if self.strip_whitespace:
+            from .filters.whitespace import Filter
+            treewalker = Filter(treewalker)
+        if self.sanitize:
+            from .filters.sanitizer import Filter
+            treewalker = Filter(treewalker)
+        if self.omit_optional_tags:
+            from .filters.optionaltags import Filter
+            treewalker = Filter(treewalker)
+
+        for token in treewalker:
+            type = token["type"]
+            if type == "Doctype":
+                doctype = "<!DOCTYPE %s" % token["name"]
+
+                if token["publicId"]:
+                    doctype += ' PUBLIC "%s"' % token["publicId"]
+                elif token["systemId"]:
+                    doctype += " SYSTEM"
+                if token["systemId"]:
+                    if token["systemId"].find('"') >= 0:
+                        if token["systemId"].find("'") >= 0:
+                            self.serializeError("System identifier contains both single and double quote characters")
+                        quote_char = "'"
+                    else:
+                        quote_char = '"'
+                    doctype += " %s%s%s" % (quote_char, token["systemId"], quote_char)
+
+                doctype += ">"
+                yield self.encodeStrict(doctype)
+
+            elif type in ("Characters", "SpaceCharacters"):
+                if type == "SpaceCharacters" or in_cdata:
+                    if in_cdata and token["data"].find("</") >= 0:
+                        self.serializeError("Unexpected </ in CDATA")
+                    yield self.encode(token["data"])
+                else:
+                    yield self.encode(escape(token["data"]))
+
+            elif type in ("StartTag", "EmptyTag"):
+                name = token["name"]
+                yield self.encodeStrict("<%s" % name)
+                if name in rcdataElements and not self.escape_rcdata:
+                    in_cdata = True
+                elif in_cdata:
+                    self.serializeError("Unexpected child element of a CDATA element")
+                for (_, attr_name), attr_value in token["data"].items():
+                    # TODO: Add namespace support here
+                    k = attr_name
+                    v = attr_value
+                    yield self.encodeStrict(' ')
+
+                    yield self.encodeStrict(k)
+                    if not self.minimize_boolean_attributes or \
+                        (k not in booleanAttributes.get(name, tuple()) and
+                         k not in booleanAttributes.get("", tuple())):
+                        yield self.encodeStrict("=")
+                        if self.quote_attr_values == "always" or len(v) == 0:
+                            quote_attr = True
+                        elif self.quote_attr_values == "spec":
+                            quote_attr = _quoteAttributeSpec.search(v) is not None
+                        elif self.quote_attr_values == "legacy":
+                            quote_attr = _quoteAttributeLegacy.search(v) is not None
+                        else:
+                            raise ValueError("quote_attr_values must be one of: "
+                                             "'always', 'spec', or 'legacy'")
+                        v = v.replace("&", "&amp;")
+                        if self.escape_lt_in_attrs:
+                            v = v.replace("<", "&lt;")
+                        if quote_attr:
+                            quote_char = self.quote_char
+                            if self.use_best_quote_char:
+                                if "'" in v and '"' not in v:
+                                    quote_char = '"'
+                                elif '"' in v and "'" not in v:
+                                    quote_char = "'"
+                            if quote_char == "'":
+                                v = v.replace("'", "&#39;")
+                            else:
+                                v = v.replace('"', "&quot;")
+                            yield self.encodeStrict(quote_char)
+                            yield self.encode(v)
+                            yield self.encodeStrict(quote_char)
+                        else:
+                            yield self.encode(v)
+                if name in voidElements and self.use_trailing_solidus:
+                    if self.space_before_trailing_solidus:
+                        yield self.encodeStrict(" /")
+                    else:
+                        yield self.encodeStrict("/")
+                yield self.encode(">")
+
+            elif type == "EndTag":
+                name = token["name"]
+                if name in rcdataElements:
+                    in_cdata = False
+                elif in_cdata:
+                    self.serializeError("Unexpected child element of a CDATA element")
+                yield self.encodeStrict("</%s>" % name)
+
+            elif type == "Comment":
+                data = token["data"]
+                if data.find("--") >= 0:
+                    self.serializeError("Comment contains --")
+                yield self.encodeStrict("<!--%s-->" % token["data"])
+
+            elif type == "Entity":
+                name = token["name"]
+                key = name + ";"
+                if key not in entities:
+                    self.serializeError("Entity %s not recognized" % name)
+                if self.resolve_entities and key not in xmlEntities:
+                    data = entities[key]
+                else:
+                    data = "&%s;" % name
+                yield self.encodeStrict(data)
+
+            else:
+                self.serializeError(token["data"])
+
+    def render(self, treewalker, encoding=None):
+        """Serializes the stream from the treewalker into a string
+
+        :arg treewalker: the treewalker to serialize
+
+        :arg encoding: the string encoding to use
+
+        :returns: the serialized tree
+
+        Example:
+
+        >>> from html5lib import parse, getTreeWalker
+        >>> from html5lib.serializer import HTMLSerializer
+        >>> token_stream = parse('<html><body>Hi!</body></html>')
+        >>> walker = getTreeWalker('etree')
+        >>> serializer = HTMLSerializer(omit_optional_tags=False)
+        >>> serializer.render(walker(token_stream))
+        '<html><head></head><body>Hi!</body></html>'
+
         """
-        f.write(self.dumps(obj, salt))
+        if encoding:
+            return b"".join(list(self.serialize(treewalker, encoding)))
+        else:
+            return "".join(list(self.serialize(treewalker)))
 
-    def loads(
-        self, s: _t_str_bytes, salt: _t_opt_str_bytes = None, **kwargs: _t.Any
-    ) -> _t.Any:
-        """Reverse of :meth:`dumps`. Raises :exc:`.BadSignature` if the
-        signature validation fails.
-        """
-        s = want_bytes(s)
-        last_exception = None
+    def serializeError(self, data="XXX ERROR MESSAGE NEEDED"):
+        # XXX The idea is to make data mandatory.
+        self.errors.append(data)
+        if self.strict:
+            raise SerializeError
 
-        for signer in self.iter_unsigners(salt):
-            try:
-                return self.load_payload(signer.unsign(s))
-            except BadSignature as err:
-                last_exception = err
 
-        raise _t.cast(BadSignature, last_exception)
-
-    def load(self, f: _t.IO, salt: _t_opt_str_bytes = None) -> _t.Any:
-        """Like :meth:`loads` but loads from a file."""
-        return self.loads(f.read(), salt)
-
-    def loads_unsafe(
-        self, s: _t_str_bytes, salt: _t_opt_str_bytes = None
-    ) -> _t_load_unsafe:
-        """Like :meth:`loads` but without verifying the signature. This
-        is potentially very dangerous to use depending on how your
-        serializer works. The return value is ``(signature_valid,
-        payload)`` instead of just the payload. The first item will be a
-        boolean that indicates if the signature is valid. This function
-        never fails.
-
-        Use it for debugging only and if you know that your serializer
-        module is not exploitable (for example, do not use it with a
-        pickle serializer).
-
-        .. versionadded:: 0.15
-        """
-        return self._loads_unsafe_impl(s, salt)
-
-    def _loads_unsafe_impl(
-        self,
-        s: _t_str_bytes,
-        salt: _t_opt_str_bytes,
-        load_kwargs: _t_opt_kwargs = None,
-        load_payload_kwargs: _t_opt_kwargs = None,
-    ) -> _t_load_unsafe:
-        """Low level helper function to implement :meth:`loads_unsafe`
-        in serializer subclasses.
-        """
-        if load_kwargs is None:
-            load_kwargs = {}
-
-        try:
-            return True, self.loads(s, salt=salt, **load_kwargs)
-        except BadSignature as e:
-            if e.payload is None:
-                return False, None
-
-            if load_payload_kwargs is None:
-                load_payload_kwargs = {}
-
-            try:
-                return (
-                    False,
-                    self.load_payload(e.payload, **load_payload_kwargs),
-                )
-            except BadPayload:
-                return False, None
-
-    def load_unsafe(self, f: _t.IO, salt: _t_opt_str_bytes = None) -> _t_load_unsafe:
-        """Like :meth:`loads_unsafe` but loads from a file.
-
-        .. versionadded:: 0.15
-        """
-        return self.loads_unsafe(f.read(), salt=salt)
+class SerializeError(Exception):
+    """Error in serialized tree"""
+    pass
