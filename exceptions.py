@@ -1,48 +1,123 @@
-class UnpackException(Exception):
-    """Base class for some exceptions raised while unpacking.
+# -*- coding: utf-8 -*-
 
-    NOTE: unpack may raise exception other than subclass of
-    UnpackException.  If you want to catch all error, catch
-    Exception instead.
+"""
+requests.exceptions
+~~~~~~~~~~~~~~~~~~~
+
+This module contains the set of Requests' exceptions.
+"""
+from pip._vendor.urllib3.exceptions import HTTPError as BaseHTTPError
+
+
+class RequestException(IOError):
+    """There was an ambiguous exception that occurred while handling your
+    request.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize RequestException with `request` and `response` objects."""
+        response = kwargs.pop('response', None)
+        self.response = response
+        self.request = kwargs.pop('request', None)
+        if (response is not None and not self.request and
+                hasattr(response, 'request')):
+            self.request = self.response.request
+        super(RequestException, self).__init__(*args, **kwargs)
+
+
+class HTTPError(RequestException):
+    """An HTTP error occurred."""
+
+
+class ConnectionError(RequestException):
+    """A Connection error occurred."""
+
+
+class ProxyError(ConnectionError):
+    """A proxy error occurred."""
+
+
+class SSLError(ConnectionError):
+    """An SSL error occurred."""
+
+
+class Timeout(RequestException):
+    """The request timed out.
+
+    Catching this error will catch both
+    :exc:`~requests.exceptions.ConnectTimeout` and
+    :exc:`~requests.exceptions.ReadTimeout` errors.
     """
 
 
-class BufferFull(UnpackException):
-    pass
+class ConnectTimeout(ConnectionError, Timeout):
+    """The request timed out while trying to connect to the remote server.
 
-
-class OutOfData(UnpackException):
-    pass
-
-
-class FormatError(ValueError, UnpackException):
-    """Invalid msgpack format"""
-
-
-class StackError(ValueError, UnpackException):
-    """Too nested"""
-
-
-# Deprecated.  Use ValueError instead
-UnpackValueError = ValueError
-
-
-class ExtraData(UnpackValueError):
-    """ExtraData is raised when there is trailing data.
-
-    This exception is raised while only one-shot (not streaming)
-    unpack.
+    Requests that produced this error are safe to retry.
     """
 
-    def __init__(self, unpacked, extra):
-        self.unpacked = unpacked
-        self.extra = extra
 
-    def __str__(self):
-        return "unpack(b) received extra data."
+class ReadTimeout(Timeout):
+    """The server did not send any data in the allotted amount of time."""
 
 
-# Deprecated.  Use Exception instead to catch all exception during packing.
-PackException = Exception
-PackValueError = ValueError
-PackOverflowError = OverflowError
+class URLRequired(RequestException):
+    """A valid URL is required to make a request."""
+
+
+class TooManyRedirects(RequestException):
+    """Too many redirects."""
+
+
+class MissingSchema(RequestException, ValueError):
+    """The URL schema (e.g. http or https) is missing."""
+
+
+class InvalidSchema(RequestException, ValueError):
+    """See defaults.py for valid schemas."""
+
+
+class InvalidURL(RequestException, ValueError):
+    """The URL provided was somehow invalid."""
+
+
+class InvalidHeader(RequestException, ValueError):
+    """The header value provided was somehow invalid."""
+
+
+class InvalidProxyURL(InvalidURL):
+    """The proxy URL provided is invalid."""
+
+
+class ChunkedEncodingError(RequestException):
+    """The server declared chunked encoding but sent an invalid chunk."""
+
+
+class ContentDecodingError(RequestException, BaseHTTPError):
+    """Failed to decode response content."""
+
+
+class StreamConsumedError(RequestException, TypeError):
+    """The content for this response was already consumed."""
+
+
+class RetryError(RequestException):
+    """Custom retries logic failed"""
+
+
+class UnrewindableBodyError(RequestException):
+    """Requests encountered an error when trying to rewind a body."""
+
+# Warnings
+
+
+class RequestsWarning(Warning):
+    """Base warning for Requests."""
+
+
+class FileModeWarning(RequestsWarning, DeprecationWarning):
+    """A file was opened in text mode, but Requests determined its binary length."""
+
+
+class RequestsDependencyWarning(RequestsWarning):
+    """An imported dependency doesn't match the expected version range."""

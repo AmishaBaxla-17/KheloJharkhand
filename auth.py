@@ -1,312 +1,305 @@
-"""Network Authentication Helpers
+# -*- coding: utf-8 -*-
 
-Contains interface (MultiDomainBasicAuth) and associated glue code for
-providing credentials in the context of network requests.
+"""
+requests.auth
+~~~~~~~~~~~~~
+
+This module contains the authentication handlers for Requests.
 """
 
-import logging
-import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import re
+import time
+import hashlib
+import threading
+import warnings
 
-from pip._vendor.requests.auth import AuthBase, HTTPBasicAuth
-from pip._vendor.requests.models import Request, Response
-from pip._vendor.requests.utils import get_netrc_auth
+from base64 import b64encode
 
-from pip._internal.utils.misc import (
-    ask,
-    ask_input,
-    ask_password,
-    remove_auth_from_url,
-    split_auth_netloc_from_url,
-)
-from pip._internal.vcs.versioncontrol import AuthInfo
+from .compat import urlparse, str, basestring
+from .cookies import extract_cookies_to_jar
+from ._internal_utils import to_native_string
+from .utils import parse_dict_header
 
-logger = logging.getLogger(__name__)
+CONTENT_TYPE_FORM_URLENCODED = 'application/x-www-form-urlencoded'
+CONTENT_TYPE_MULTI_PART = 'multipart/form-data'
 
-Credentials = Tuple[str, str, str]
 
-try:
-    import keyring
-except ImportError:
-    keyring = None
-except Exception as exc:
-    logger.warning(
-        "Keyring is skipped due to an exception: %s", str(exc),
+def _basic_auth_str(username, password):
+    """Returns a Basic Auth string."""
+
+    # "I want us to put a big-ol' comment on top of it that
+    # says that this behaviour is dumb but we need to preserve
+    # it because people are relying on it."
+    #    - Lukasa
+    #
+    # These are here solely to maintain backwards compatibility
+    # for things like ints. This will be removed in 3.0.0.
+    if not isinstance(username, basestring):
+        warnings.warn(
+            "Non-string usernames will no longer be supported in Requests "
+            "3.0.0. Please convert the object you've passed in ({!r}) to "
+            "a string or bytes object in the near future to avoid "
+            "problems.".format(username),
+            category=DeprecationWarning,
+        )
+        username = str(username)
+
+    if not isinstance(password, basestring):
+        warnings.warn(
+            "Non-string passwords will no longer be supported in Requests "
+            "3.0.0. Please convert the object you've passed in ({!r}) to "
+            "a string or bytes object in the near future to avoid "
+            "problems.".format(type(password)),
+            category=DeprecationWarning,
+        )
+        password = str(password)
+    # -- End Removal --
+
+    if isinstance(username, str):
+        username = username.encode('latin1')
+
+    if isinstance(password, str):
+        password = password.encode('latin1')
+
+    authstr = 'Basic ' + to_native_string(
+        b64encode(b':'.join((username, password))).strip()
     )
-    keyring = None
+
+    return authstr
 
 
-def get_keyring_auth(url, username):
-    # type: (Optional[str], Optional[str]) -> Optional[AuthInfo]
-    """Return the tuple auth for a given url from keyring."""
-    global keyring
-    if not url or not keyring:
-        return None
+class AuthBase(object):
+    """Base class that all auth implementations derive from"""
 
-    try:
-        try:
-            get_credential = keyring.get_credential
-        except AttributeError:
-            pass
+    def __call__(self, r):
+        raise NotImplementedError('Auth hooks must be callable.')
+
+
+class HTTPBasicAuth(AuthBase):
+    """Attaches HTTP Basic Authentication to the given Request object."""
+
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+
+    def __eq__(self, other):
+        return all([
+            self.username == getattr(other, 'username', None),
+            self.password == getattr(other, 'password', None)
+        ])
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __call__(self, r):
+        r.headers['Authorization'] = _basic_auth_str(self.username, self.password)
+        return r
+
+
+class HTTPProxyAuth(HTTPBasicAuth):
+    """Attaches HTTP Proxy Authentication to a given Request object."""
+
+    def __call__(self, r):
+        r.headers['Proxy-Authorization'] = _basic_auth_str(self.username, self.password)
+        return r
+
+
+class HTTPDigestAuth(AuthBase):
+    """Attaches HTTP Digest Authentication to the given Request object."""
+
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+        # Keep state in per-thread local storage
+        self._thread_local = threading.local()
+
+    def init_per_thread_state(self):
+        # Ensure state is initialized just once per-thread
+        if not hasattr(self._thread_local, 'init'):
+            self._thread_local.init = True
+            self._thread_local.last_nonce = ''
+            self._thread_local.nonce_count = 0
+            self._thread_local.chal = {}
+            self._thread_local.pos = None
+            self._thread_local.num_401_calls = None
+
+    def build_digest_header(self, method, url):
+        """
+        :rtype: str
+        """
+
+        realm = self._thread_local.chal['realm']
+        nonce = self._thread_local.chal['nonce']
+        qop = self._thread_local.chal.get('qop')
+        algorithm = self._thread_local.chal.get('algorithm')
+        opaque = self._thread_local.chal.get('opaque')
+        hash_utf8 = None
+
+        if algorithm is None:
+            _algorithm = 'MD5'
         else:
-            logger.debug("Getting credentials from keyring for %s", url)
-            cred = get_credential(url, username)
-            if cred is not None:
-                return cred.username, cred.password
+            _algorithm = algorithm.upper()
+        # lambdas assume digest modules are imported at the top level
+        if _algorithm == 'MD5' or _algorithm == 'MD5-SESS':
+            def md5_utf8(x):
+                if isinstance(x, str):
+                    x = x.encode('utf-8')
+                return hashlib.md5(x).hexdigest()
+            hash_utf8 = md5_utf8
+        elif _algorithm == 'SHA':
+            def sha_utf8(x):
+                if isinstance(x, str):
+                    x = x.encode('utf-8')
+                return hashlib.sha1(x).hexdigest()
+            hash_utf8 = sha_utf8
+        elif _algorithm == 'SHA-256':
+            def sha256_utf8(x):
+                if isinstance(x, str):
+                    x = x.encode('utf-8')
+                return hashlib.sha256(x).hexdigest()
+            hash_utf8 = sha256_utf8
+        elif _algorithm == 'SHA-512':
+            def sha512_utf8(x):
+                if isinstance(x, str):
+                    x = x.encode('utf-8')
+                return hashlib.sha512(x).hexdigest()
+            hash_utf8 = sha512_utf8
+
+        KD = lambda s, d: hash_utf8("%s:%s" % (s, d))
+
+        if hash_utf8 is None:
             return None
 
-        if username:
-            logger.debug("Getting password from keyring for %s", url)
-            password = keyring.get_password(url, username)
-            if password:
-                return username, password
+        # XXX not implemented yet
+        entdig = None
+        p_parsed = urlparse(url)
+        #: path is request-uri defined in RFC 2616 which should not be empty
+        path = p_parsed.path or "/"
+        if p_parsed.query:
+            path += '?' + p_parsed.query
 
-    except Exception as exc:
-        logger.warning(
-            "Keyring is skipped due to an exception: %s", str(exc),
-        )
-        keyring = None
-    return None
+        A1 = '%s:%s:%s' % (self.username, realm, self.password)
+        A2 = '%s:%s' % (method, path)
 
+        HA1 = hash_utf8(A1)
+        HA2 = hash_utf8(A2)
 
-class MultiDomainBasicAuth(AuthBase):
+        if nonce == self._thread_local.last_nonce:
+            self._thread_local.nonce_count += 1
+        else:
+            self._thread_local.nonce_count = 1
+        ncvalue = '%08x' % self._thread_local.nonce_count
+        s = str(self._thread_local.nonce_count).encode('utf-8')
+        s += nonce.encode('utf-8')
+        s += time.ctime().encode('utf-8')
+        s += os.urandom(8)
 
-    def __init__(self, prompting=True, index_urls=None):
-        # type: (bool, Optional[List[str]]) -> None
-        self.prompting = prompting
-        self.index_urls = index_urls
-        self.passwords = {}  # type: Dict[str, AuthInfo]
-        # When the user is prompted to enter credentials and keyring is
-        # available, we will offer to save them. If the user accepts,
-        # this value is set to the credentials they entered. After the
-        # request authenticates, the caller should call
-        # ``save_credentials`` to save these.
-        self._credentials_to_save = None  # type: Optional[Credentials]
+        cnonce = (hashlib.sha1(s).hexdigest()[:16])
+        if _algorithm == 'MD5-SESS':
+            HA1 = hash_utf8('%s:%s:%s' % (HA1, nonce, cnonce))
 
-    def _get_index_url(self, url):
-        # type: (str) -> Optional[str]
-        """Return the original index URL matching the requested URL.
-
-        Cached or dynamically generated credentials may work against
-        the original index URL rather than just the netloc.
-
-        The provided url should have had its username and password
-        removed already. If the original index url had credentials then
-        they will be included in the return value.
-
-        Returns None if no matching index was found, or if --no-index
-        was specified by the user.
-        """
-        if not url or not self.index_urls:
+        if not qop:
+            respdig = KD(HA1, "%s:%s" % (nonce, HA2))
+        elif qop == 'auth' or 'auth' in qop.split(','):
+            noncebit = "%s:%s:%s:%s:%s" % (
+                nonce, ncvalue, cnonce, 'auth', HA2
+            )
+            respdig = KD(HA1, noncebit)
+        else:
+            # XXX handle auth-int.
             return None
 
-        for u in self.index_urls:
-            prefix = remove_auth_from_url(u).rstrip("/") + "/"
-            if url.startswith(prefix):
-                return u
-        return None
+        self._thread_local.last_nonce = nonce
 
-    def _get_new_credentials(self, original_url, allow_netrc=True,
-                             allow_keyring=False):
-        # type: (str, bool, bool) -> AuthInfo
-        """Find and return credentials for the specified URL."""
-        # Split the credentials and netloc from the url.
-        url, netloc, url_user_password = split_auth_netloc_from_url(
-            original_url,
-        )
+        # XXX should the partial digests be encoded too?
+        base = 'username="%s", realm="%s", nonce="%s", uri="%s", ' \
+               'response="%s"' % (self.username, realm, nonce, path, respdig)
+        if opaque:
+            base += ', opaque="%s"' % opaque
+        if algorithm:
+            base += ', algorithm="%s"' % algorithm
+        if entdig:
+            base += ', digest="%s"' % entdig
+        if qop:
+            base += ', qop="auth", nc=%s, cnonce="%s"' % (ncvalue, cnonce)
 
-        # Start with the credentials embedded in the url
-        username, password = url_user_password
-        if username is not None and password is not None:
-            logger.debug("Found credentials in url for %s", netloc)
-            return url_user_password
+        return 'Digest %s' % (base)
 
-        # Find a matching index url for this request
-        index_url = self._get_index_url(url)
-        if index_url:
-            # Split the credentials from the url.
-            index_info = split_auth_netloc_from_url(index_url)
-            if index_info:
-                index_url, _, index_url_user_password = index_info
-                logger.debug("Found index url %s", index_url)
+    def handle_redirect(self, r, **kwargs):
+        """Reset num_401_calls counter on redirects."""
+        if r.is_redirect:
+            self._thread_local.num_401_calls = 1
 
-        # If an index URL was found, try its embedded credentials
-        if index_url and index_url_user_password[0] is not None:
-            username, password = index_url_user_password
-            if username is not None and password is not None:
-                logger.debug("Found credentials in index url for %s", netloc)
-                return index_url_user_password
-
-        # Get creds from netrc if we still don't have them
-        if allow_netrc:
-            netrc_auth = get_netrc_auth(original_url)
-            if netrc_auth:
-                logger.debug("Found credentials in netrc for %s", netloc)
-                return netrc_auth
-
-        # If we don't have a password and keyring is available, use it.
-        if allow_keyring:
-            # The index url is more specific than the netloc, so try it first
-            kr_auth = (
-                get_keyring_auth(index_url, username) or
-                get_keyring_auth(netloc, username)
-            )
-            if kr_auth:
-                logger.debug("Found credentials in keyring for %s", netloc)
-                return kr_auth
-
-        return username, password
-
-    def _get_url_and_credentials(self, original_url):
-        # type: (str) -> Tuple[str, Optional[str], Optional[str]]
-        """Return the credentials to use for the provided URL.
-
-        If allowed, netrc and keyring may be used to obtain the
-        correct credentials.
-
-        Returns (url_without_credentials, username, password). Note
-        that even if the original URL contains credentials, this
-        function may return a different username and password.
+    def handle_401(self, r, **kwargs):
         """
-        url, netloc, _ = split_auth_netloc_from_url(original_url)
+        Takes the given response and tries digest-auth, if needed.
 
-        # Use any stored credentials that we have for this netloc
-        username, password = self.passwords.get(netloc, (None, None))
+        :rtype: requests.Response
+        """
 
-        if username is None and password is None:
-            # No stored credentials. Acquire new credentials without prompting
-            # the user. (e.g. from netrc, keyring, or the URL itself)
-            username, password = self._get_new_credentials(original_url)
+        # If response is not 4xx, do not auth
+        # See https://github.com/psf/requests/issues/3772
+        if not 400 <= r.status_code < 500:
+            self._thread_local.num_401_calls = 1
+            return r
 
-        if username is not None or password is not None:
-            # Convert the username and password if they're None, so that
-            # this netloc will show up as "cached" in the conditional above.
-            # Further, HTTPBasicAuth doesn't accept None, so it makes sense to
-            # cache the value that is going to be used.
-            username = username or ""
-            password = password or ""
+        if self._thread_local.pos is not None:
+            # Rewind the file position indicator of the body to where
+            # it was to resend the request.
+            r.request.body.seek(self._thread_local.pos)
+        s_auth = r.headers.get('www-authenticate', '')
 
-            # Store any acquired credentials.
-            self.passwords[netloc] = (username, password)
+        if 'digest' in s_auth.lower() and self._thread_local.num_401_calls < 2:
 
-        assert (
-            # Credentials were found
-            (username is not None and password is not None) or
-            # Credentials were not found
-            (username is None and password is None)
-        ), f"Could not load credentials from url: {original_url}"
+            self._thread_local.num_401_calls += 1
+            pat = re.compile(r'digest ', flags=re.IGNORECASE)
+            self._thread_local.chal = parse_dict_header(pat.sub('', s_auth, count=1))
 
-        return url, username, password
+            # Consume content and release the original connection
+            # to allow our new request to reuse the same one.
+            r.content
+            r.close()
+            prep = r.request.copy()
+            extract_cookies_to_jar(prep._cookies, r.request, r.raw)
+            prep.prepare_cookies(prep._cookies)
 
-    def __call__(self, req):
-        # type: (Request) -> Request
-        # Get credentials for this request
-        url, username, password = self._get_url_and_credentials(req.url)
+            prep.headers['Authorization'] = self.build_digest_header(
+                prep.method, prep.url)
+            _r = r.connection.send(prep, **kwargs)
+            _r.history.append(r)
+            _r.request = prep
 
-        # Set the url of the request to the url without any credentials
-        req.url = url
+            return _r
 
-        if username is not None and password is not None:
-            # Send the basic auth with this request
-            req = HTTPBasicAuth(username, password)(req)
+        self._thread_local.num_401_calls = 1
+        return r
 
-        # Attach a hook to handle 401 responses
-        req.register_hook("response", self.handle_401)
+    def __call__(self, r):
+        # Initialize per-thread state, if needed
+        self.init_per_thread_state()
+        # If we have a saved nonce, skip the 401
+        if self._thread_local.last_nonce:
+            r.headers['Authorization'] = self.build_digest_header(r.method, r.url)
+        try:
+            self._thread_local.pos = r.body.tell()
+        except AttributeError:
+            # In the case of HTTPDigestAuth being reused and the body of
+            # the previous request was a file-like object, pos has the
+            # file position of the previous body. Ensure it's set to
+            # None.
+            self._thread_local.pos = None
+        r.register_hook('response', self.handle_401)
+        r.register_hook('response', self.handle_redirect)
+        self._thread_local.num_401_calls = 1
 
-        return req
+        return r
 
-    # Factored out to allow for easy patching in tests
-    def _prompt_for_password(self, netloc):
-        # type: (str) -> Tuple[Optional[str], Optional[str], bool]
-        username = ask_input(f"User for {netloc}: ")
-        if not username:
-            return None, None, False
-        auth = get_keyring_auth(netloc, username)
-        if auth and auth[0] is not None and auth[1] is not None:
-            return auth[0], auth[1], False
-        password = ask_password("Password: ")
-        return username, password, True
+    def __eq__(self, other):
+        return all([
+            self.username == getattr(other, 'username', None),
+            self.password == getattr(other, 'password', None)
+        ])
 
-    # Factored out to allow for easy patching in tests
-    def _should_save_password_to_keyring(self):
-        # type: () -> bool
-        if not keyring:
-            return False
-        return ask("Save credentials to keyring [y/N]: ", ["y", "n"]) == "y"
-
-    def handle_401(self, resp, **kwargs):
-        # type: (Response, **Any) -> Response
-        # We only care about 401 responses, anything else we want to just
-        #   pass through the actual response
-        if resp.status_code != 401:
-            return resp
-
-        # We are not able to prompt the user so simply return the response
-        if not self.prompting:
-            return resp
-
-        parsed = urllib.parse.urlparse(resp.url)
-
-        # Query the keyring for credentials:
-        username, password = self._get_new_credentials(resp.url,
-                                                       allow_netrc=False,
-                                                       allow_keyring=True)
-
-        # Prompt the user for a new username and password
-        save = False
-        if not username and not password:
-            username, password, save = self._prompt_for_password(parsed.netloc)
-
-        # Store the new username and password to use for future requests
-        self._credentials_to_save = None
-        if username is not None and password is not None:
-            self.passwords[parsed.netloc] = (username, password)
-
-            # Prompt to save the password to keyring
-            if save and self._should_save_password_to_keyring():
-                self._credentials_to_save = (parsed.netloc, username, password)
-
-        # Consume content and release the original connection to allow our new
-        #   request to reuse the same one.
-        resp.content
-        resp.raw.release_conn()
-
-        # Add our new username and password to the request
-        req = HTTPBasicAuth(username or "", password or "")(resp.request)
-        req.register_hook("response", self.warn_on_401)
-
-        # On successful request, save the credentials that were used to
-        # keyring. (Note that if the user responded "no" above, this member
-        # is not set and nothing will be saved.)
-        if self._credentials_to_save:
-            req.register_hook("response", self.save_credentials)
-
-        # Send our new request
-        new_resp = resp.connection.send(req, **kwargs)
-        new_resp.history.append(resp)
-
-        return new_resp
-
-    def warn_on_401(self, resp, **kwargs):
-        # type: (Response, **Any) -> None
-        """Response callback to warn about incorrect credentials."""
-        if resp.status_code == 401:
-            logger.warning(
-                '401 Error, Credentials not correct for %s', resp.request.url,
-            )
-
-    def save_credentials(self, resp, **kwargs):
-        # type: (Response, **Any) -> None
-        """Response callback to save credentials on success."""
-        assert keyring is not None, "should never reach here without keyring"
-        if not keyring:
-            return
-
-        creds = self._credentials_to_save
-        self._credentials_to_save = None
-        if creds and resp.status_code < 400:
-            try:
-                logger.info('Saving credentials to keyring')
-                keyring.set_password(*creds)
-            except Exception:
-                logger.exception('Failed to save credentials')
+    def __ne__(self, other):
+        return not self == other

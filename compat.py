@@ -1,34 +1,76 @@
-"""Python 2/3 compatibility"""
-import json
+# -*- coding: utf-8 -*-
+
+"""
+requests.compat
+~~~~~~~~~~~~~~~
+
+This module handles import compatibility issues between Python 2 and
+Python 3.
+"""
+
+from pip._vendor import chardet
+
 import sys
 
+# -------
+# Pythons
+# -------
 
-# Handle reading and writing JSON in UTF-8, on Python 3 and 2.
+# Syntax sugar.
+_ver = sys.version_info
 
-if sys.version_info[0] >= 3:
-    # Python 3
-    def write_json(obj, path, **kwargs):
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(obj, f, **kwargs)
+#: Python 2.x?
+is_py2 = (_ver[0] == 2)
 
-    def read_json(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+#: Python 3.x?
+is_py3 = (_ver[0] == 3)
 
-else:
-    # Python 2
-    def write_json(obj, path, **kwargs):
-        with open(path, 'wb') as f:
-            json.dump(obj, f, encoding='utf-8', **kwargs)
+# Note: We've patched out simplejson support in pip because it prevents
+#       upgrading simplejson on Windows.
+# try:
+#     import simplejson as json
+# except (ImportError, SyntaxError):
+#     # simplejson does not support Python 3.2, it throws a SyntaxError
+#     # because of u'...' Unicode literals.
+import json
 
-    def read_json(path):
-        with open(path, 'rb') as f:
-            return json.load(f)
+# ---------
+# Specifics
+# ---------
+
+if is_py2:
+    from urllib import (
+        quote, unquote, quote_plus, unquote_plus, urlencode, getproxies,
+        proxy_bypass, proxy_bypass_environment, getproxies_environment)
+    from urlparse import urlparse, urlunparse, urljoin, urlsplit, urldefrag
+    from urllib2 import parse_http_list
+    import cookielib
+    from Cookie import Morsel
+    from StringIO import StringIO
+    # Keep OrderedDict for backwards compatibility.
+    from collections import Callable, Mapping, MutableMapping, OrderedDict
 
 
-# FileNotFoundError
+    builtin_str = str
+    bytes = str
+    str = unicode
+    basestring = basestring
+    numeric_types = (int, long, float)
+    integer_types = (int, long)
 
-try:
-    FileNotFoundError = FileNotFoundError
-except NameError:
-    FileNotFoundError = IOError
+elif is_py3:
+    from urllib.parse import urlparse, urlunparse, urljoin, urlsplit, urlencode, quote, unquote, quote_plus, unquote_plus, urldefrag
+    from urllib.request import parse_http_list, getproxies, proxy_bypass, proxy_bypass_environment, getproxies_environment
+    from http import cookiejar as cookielib
+    from http.cookies import Morsel
+    from io import StringIO
+    # Keep OrderedDict for backwards compatibility.
+    from collections import OrderedDict
+    from collections.abc import Callable, Mapping, MutableMapping
+
+    builtin_str = str
+    str = str
+    bytes = bytes
+    basestring = (str, bytes)
+    numeric_types = (int, float)
+    integer_types = (int,)
