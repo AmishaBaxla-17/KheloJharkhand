@@ -1,111 +1,92 @@
-"""Functions that expose information about templates that might be
-interesting for introspection.
+"""Build metadata for a project using PEP 517 hooks.
 """
-import typing as t
+import argparse
+import logging
+import os
+import shutil
+import functools
 
-from . import nodes
-from .compiler import CodeGenerator
-from .compiler import Frame
+try:
+    import importlib.metadata as imp_meta
+except ImportError:
+    import importlib_metadata as imp_meta
 
-if t.TYPE_CHECKING:
-    from .environment import Environment
+try:
+    from zipfile import Path
+except ImportError:
+    from zipp import Path
 
+from .envbuild import BuildEnvironment
+from .wrappers import Pep517HookCaller, quiet_subprocess_runner
+from .dirtools import tempdir, mkdir_p, dir_to_zipfile
+from .build import validate_system, load_system, compat_system
 
-class TrackingCodeGenerator(CodeGenerator):
-    """We abuse the code generator for introspection."""
-
-    def __init__(self, environment: "Environment") -> None:
-        super().__init__(environment, "<introspection>", "<introspection>")
-        self.undeclared_identifiers: t.Set[str] = set()
-
-    def write(self, x: str) -> None:
-        """Don't write."""
-
-    def enter_frame(self, frame: Frame) -> None:
-        """Remember all undeclared identifiers."""
-        super().enter_frame(frame)
-
-        for _, (action, param) in frame.symbols.loads.items():
-            if action == "resolve" and param not in self.environment.globals:
-                self.undeclared_identifiers.add(param)
+log = logging.getLogger(__name__)
 
 
-def find_undeclared_variables(ast: nodes.Template) -> t.Set[str]:
-    """Returns a set of all variables in the AST that will be looked up from
-    the context at runtime.  Because at compile time it's not known which
-    variables will be used depending on the path the execution takes at
-    runtime, all variables are returned.
+def _prep_meta(hooks, env, dest):
+    reqs = hooks.get_requires_for_build_wheel({})
+    log.info('Got build requires: %s', reqs)
 
-    >>> from jinja2 import Environment, meta
-    >>> env = Environment()
-    >>> ast = env.parse('{% set foo = 42 %}{{ bar + foo }}')
-    >>> meta.find_undeclared_variables(ast) == {'bar'}
-    True
+    env.pip_install(reqs)
+    log.info('Installed dynamic build dependencies')
 
-    .. admonition:: Implementation
+    with tempdir() as td:
+        log.info('Trying to build metadata in %s', td)
+        filename = hooks.prepare_metadata_for_build_wheel(td, {})
+        source = os.path.join(td, filename)
+        shutil.move(source, os.path.join(dest, os.path.basename(filename)))
 
-       Internally the code generator is used for finding undeclared variables.
-       This is good to know because the code generator might raise a
-       :exc:`TemplateAssertionError` during compilation and as a matter of
-       fact this function can currently raise that exception as well.
+
+def build(source_dir='.', dest=None, system=None):
+    system = system or load_system(source_dir)
+    dest = os.path.join(source_dir, dest or 'dist')
+    mkdir_p(dest)
+    validate_system(system)
+    hooks = Pep517HookCaller(
+        source_dir, system['build-backend'], system.get('backend-path')
+    )
+
+    with hooks.subprocess_runner(quiet_subprocess_runner):
+        with BuildEnvironment() as env:
+            env.pip_install(system['requires'])
+            _prep_meta(hooks, env, dest)
+
+
+def build_as_zip(builder=build):
+    with tempdir() as out_dir:
+        builder(dest=out_dir)
+        return dir_to_zipfile(out_dir)
+
+
+def load(root):
     """
-    codegen = TrackingCodeGenerator(ast.environment)  # type: ignore
-    codegen.visit(ast)
-    return codegen.undeclared_identifiers
-
-
-_ref_types = (nodes.Extends, nodes.FromImport, nodes.Import, nodes.Include)
-_RefType = t.Union[nodes.Extends, nodes.FromImport, nodes.Import, nodes.Include]
-
-
-def find_referenced_templates(ast: nodes.Template) -> t.Iterator[t.Optional[str]]:
-    """Finds all the referenced templates from the AST.  This will return an
-    iterator over all the hardcoded template extensions, inclusions and
-    imports.  If dynamic inheritance or inclusion is used, `None` will be
-    yielded.
-
-    >>> from jinja2 import Environment, meta
-    >>> env = Environment()
-    >>> ast = env.parse('{% extends "layout.html" %}{% include helper %}')
-    >>> list(meta.find_referenced_templates(ast))
-    ['layout.html', None]
-
-    This function is useful for dependency tracking.  For example if you want
-    to rebuild parts of the website after a layout template has changed.
+    Given a source directory (root) of a package,
+    return an importlib.metadata.Distribution object
+    with metadata build from that package.
     """
-    template_name: t.Any
+    root = os.path.expanduser(root)
+    system = compat_system(root)
+    builder = functools.partial(build, source_dir=root, system=system)
+    path = Path(build_as_zip(builder))
+    return imp_meta.PathDistribution(path)
 
-    for node in ast.find_all(_ref_types):
-        template: nodes.Expr = node.template  # type: ignore
 
-        if not isinstance(template, nodes.Const):
-            # a tuple with some non consts in there
-            if isinstance(template, (nodes.Tuple, nodes.List)):
-                for template_name in template.items:
-                    # something const, only yield the strings and ignore
-                    # non-string consts that really just make no sense
-                    if isinstance(template_name, nodes.Const):
-                        if isinstance(template_name.value, str):
-                            yield template_name.value
-                    # something dynamic in there
-                    else:
-                        yield None
-            # something dynamic we don't know about here
-            else:
-                yield None
-            continue
-        # constant is a basestring, direct template name
-        if isinstance(template.value, str):
-            yield template.value
-        # a tuple or list (latter *should* not happen) made of consts,
-        # yield the consts that are strings.  We could warn here for
-        # non string values
-        elif isinstance(node, nodes.Include) and isinstance(
-            template.value, (tuple, list)
-        ):
-            for template_name in template.value:
-                if isinstance(template_name, str):
-                    yield template_name
-        # something else we don't care about, we could warn here
-        else:
-            yield None
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    'source_dir',
+    help="A directory containing pyproject.toml",
+)
+parser.add_argument(
+    '--out-dir', '-o',
+    help="Destination in which to save the builds relative to source dir",
+)
+
+
+def main():
+    args = parser.parse_args()
+    build(args.source_dir, args.out_dir)
+
+
+if __name__ == '__main__':
+    main()

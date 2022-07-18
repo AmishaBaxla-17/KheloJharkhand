@@ -1,26 +1,17 @@
-# This file is dual licensed under the terms of the Apache License, Version
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
-# for complete details.
-from __future__ import absolute_import, division, print_function
+"""This is a subpackage because the directory is on sys.path for _in_process.py
 
-from .__about__ import (
-    __author__,
-    __copyright__,
-    __email__,
-    __license__,
-    __summary__,
-    __title__,
-    __uri__,
-    __version__,
-)
+The subpackage should stay as empty as possible to avoid shadowing modules that
+the backend might import.
+"""
+from os.path import dirname, abspath, join as pjoin
+from contextlib import contextmanager
 
-__all__ = [
-    "__title__",
-    "__summary__",
-    "__uri__",
-    "__version__",
-    "__author__",
-    "__email__",
-    "__license__",
-    "__copyright__",
-]
+try:
+    import importlib.resources as resources
+
+    def _in_proc_script_path():
+        return resources.path(__package__, '_in_process.py')
+except ImportError:
+    @contextmanager
+    def _in_proc_script_path():
+        yield pjoin(dirname(abspath(__file__)), '_in_process.py')
