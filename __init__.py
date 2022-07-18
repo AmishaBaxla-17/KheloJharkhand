@@ -1,25 +1,22 @@
-"""Python module which parses and emits TOML.
+import sys
 
-Released under the MIT license.
-"""
+try:
+    # Our match_hostname function is the same as 3.5's, so we only want to
+    # import the match_hostname function if it's at least that good.
+    if sys.version_info < (3, 5):
+        raise ImportError("Fallback to vendored code")
 
-from pip._vendor.toml import encoder
-from pip._vendor.toml import decoder
+    from ssl import CertificateError, match_hostname
+except ImportError:
+    try:
+        # Backport of the function from a pypi module
+        from backports.ssl_match_hostname import (  # type: ignore
+            CertificateError,
+            match_hostname,
+        )
+    except ImportError:
+        # Our vendored copy
+        from ._implementation import CertificateError, match_hostname  # type: ignore
 
-__version__ = "0.10.2"
-_spec_ = "0.5.0"
-
-load = decoder.load
-loads = decoder.loads
-TomlDecoder = decoder.TomlDecoder
-TomlDecodeError = decoder.TomlDecodeError
-TomlPreserveCommentDecoder = decoder.TomlPreserveCommentDecoder
-
-dump = encoder.dump
-dumps = encoder.dumps
-TomlEncoder = encoder.TomlEncoder
-TomlArraySeparatorEncoder = encoder.TomlArraySeparatorEncoder
-TomlPreserveInlineDictEncoder = encoder.TomlPreserveInlineDictEncoder
-TomlNumpyEncoder = encoder.TomlNumpyEncoder
-TomlPreserveCommentEncoder = encoder.TomlPreserveCommentEncoder
-TomlPathlibEncoder = encoder.TomlPathlibEncoder
+# Not needed, but documenting what we provide.
+__all__ = ("CertificateError", "match_hostname")

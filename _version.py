@@ -1,1 +1,2 @@
-version = (1, 0, 2)
+# This file is protected via CODEOWNERS
+__version__ = "1.26.4"
