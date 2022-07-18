@@ -1,159 +1,159 @@
-from __future__ import absolute_import, division, unicode_literals
+# Copyright 2016 Julien Danjou
+# Copyright 2016 Joshua Harlow
+# Copyright 2013-2014 Ray Holder
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from types import ModuleType
+import inspect
+import sys
+import time
+from functools import update_wrapper
 
+from pip._vendor import six
+
+# sys.maxint / 2, since Python 3.2 doesn't have a sys.maxint...
 try:
-    from collections.abc import Mapping
-except ImportError:
-    from collections import Mapping
+    MAX_WAIT = sys.maxint / 2
+except AttributeError:
+    MAX_WAIT = 1073741823
 
-from pip._vendor.six import text_type, PY3
 
-if PY3:
-    import xml.etree.ElementTree as default_etree
+if six.PY2:
+    from functools import WRAPPER_ASSIGNMENTS, WRAPPER_UPDATES
+
+    def wraps(fn):
+        """Do the same as six.wraps but only copy attributes that exist.
+
+        For example, object instances don't have __name__ attribute, so
+        six.wraps fails. This is fixed in Python 3
+        (https://bugs.python.org/issue3445), but didn't get backported to six.
+
+        Also, see https://github.com/benjaminp/six/issues/250.
+        """
+
+        def filter_hasattr(obj, attrs):
+            return tuple(a for a in attrs if hasattr(obj, a))
+
+        return six.wraps(
+            fn,
+            assigned=filter_hasattr(fn, WRAPPER_ASSIGNMENTS),
+            updated=filter_hasattr(fn, WRAPPER_UPDATES),
+        )
+
+    def capture(fut, tb):
+        # TODO(harlowja): delete this in future, since its
+        # has to repeatedly calculate this crap.
+        fut.set_exception_info(tb[1], tb[2])
+
+    def getargspec(func):
+        # This was deprecated in Python 3.
+        return inspect.getargspec(func)
+
+
 else:
-    try:
-        import xml.etree.cElementTree as default_etree
-    except ImportError:
-        import xml.etree.ElementTree as default_etree
+    from functools import wraps  # noqa
+
+    def capture(fut, tb):
+        fut.set_exception(tb[1])
+
+    def getargspec(func):
+        return inspect.getfullargspec(func)
 
 
-__all__ = ["default_etree", "MethodDispatcher", "isSurrogatePair",
-           "surrogatePairToCodepoint", "moduleFactoryFactory",
-           "supports_lone_surrogates"]
+def visible_attrs(obj, attrs=None):
+    if attrs is None:
+        attrs = {}
+    for attr_name, attr in inspect.getmembers(obj):
+        if attr_name.startswith("_"):
+            continue
+        attrs[attr_name] = attr
+    return attrs
 
 
-# Platforms not supporting lone surrogates (\uD800-\uDFFF) should be
-# caught by the below test. In general this would be any platform
-# using UTF-16 as its encoding of unicode strings, such as
-# Jython. This is because UTF-16 itself is based on the use of such
-# surrogates, and there is no mechanism to further escape such
-# escapes.
-try:
-    _x = eval('"\\uD800"')  # pylint:disable=eval-used
-    if not isinstance(_x, text_type):
-        # We need this with u"" because of http://bugs.jython.org/issue2039
-        _x = eval('u"\\uD800"')  # pylint:disable=eval-used
-        assert isinstance(_x, text_type)
-except Exception:
-    supports_lone_surrogates = False
-else:
-    supports_lone_surrogates = True
+def find_ordinal(pos_num):
+    # See: https://en.wikipedia.org/wiki/English_numerals#Ordinal_numbers
+    if pos_num == 0:
+        return "th"
+    elif pos_num == 1:
+        return "st"
+    elif pos_num == 2:
+        return "nd"
+    elif pos_num == 3:
+        return "rd"
+    elif pos_num >= 4 and pos_num <= 20:
+        return "th"
+    else:
+        return find_ordinal(pos_num % 10)
 
 
-class MethodDispatcher(dict):
-    """Dict with 2 special properties:
+def to_ordinal(pos_num):
+    return "%i%s" % (pos_num, find_ordinal(pos_num))
 
-    On initiation, keys that are lists, sets or tuples are converted to
-    multiple keys so accessing any one of the items in the original
-    list-like object returns the matching value
 
-    md = MethodDispatcher({("foo", "bar"):"baz"})
-    md["foo"] == "baz"
+def get_callback_name(cb):
+    """Get a callback fully-qualified name.
 
-    A default value which can be set through the default attribute.
+    If no name can be produced ``repr(cb)`` is called and returned.
     """
-
-    def __init__(self, items=()):
-        _dictEntries = []
-        for name, value in items:
-            if isinstance(name, (list, tuple, frozenset, set)):
-                for item in name:
-                    _dictEntries.append((item, value))
-            else:
-                _dictEntries.append((name, value))
-        dict.__init__(self, _dictEntries)
-        assert len(self) == len(_dictEntries)
-        self.default = None
-
-    def __getitem__(self, key):
-        return dict.get(self, key, self.default)
-
-    def __get__(self, instance, owner=None):
-        return BoundMethodDispatcher(instance, self)
-
-
-class BoundMethodDispatcher(Mapping):
-    """Wraps a MethodDispatcher, binding its return values to `instance`"""
-    def __init__(self, instance, dispatcher):
-        self.instance = instance
-        self.dispatcher = dispatcher
-
-    def __getitem__(self, key):
-        # see https://docs.python.org/3/reference/datamodel.html#object.__get__
-        # on a function, __get__ is used to bind a function to an instance as a bound method
-        return self.dispatcher[key].__get__(self.instance)
-
-    def get(self, key, default):
-        if key in self.dispatcher:
-            return self[key]
-        else:
-            return default
-
-    def __iter__(self):
-        return iter(self.dispatcher)
-
-    def __len__(self):
-        return len(self.dispatcher)
-
-    def __contains__(self, key):
-        return key in self.dispatcher
-
-
-# Some utility functions to deal with weirdness around UCS2 vs UCS4
-# python builds
-
-def isSurrogatePair(data):
-    return (len(data) == 2 and
-            ord(data[0]) >= 0xD800 and ord(data[0]) <= 0xDBFF and
-            ord(data[1]) >= 0xDC00 and ord(data[1]) <= 0xDFFF)
-
-
-def surrogatePairToCodepoint(data):
-    char_val = (0x10000 + (ord(data[0]) - 0xD800) * 0x400 +
-                (ord(data[1]) - 0xDC00))
-    return char_val
-
-# Module Factory Factory (no, this isn't Java, I know)
-# Here to stop this being duplicated all over the place.
-
-
-def moduleFactoryFactory(factory):
-    moduleCache = {}
-
-    def moduleFactory(baseModule, *args, **kwargs):
-        if isinstance(ModuleType.__name__, type("")):
-            name = "_%s_factory" % baseModule.__name__
-        else:
-            name = b"_%s_factory" % baseModule.__name__
-
-        kwargs_tuple = tuple(kwargs.items())
-
+    segments = []
+    try:
+        segments.append(cb.__qualname__)
+    except AttributeError:
         try:
-            return moduleCache[name][args][kwargs_tuple]
-        except KeyError:
-            mod = ModuleType(name)
-            objs = factory(baseModule, *args, **kwargs)
-            mod.__dict__.update(objs)
-            if "name" not in moduleCache:
-                moduleCache[name] = {}
-            if "args" not in moduleCache[name]:
-                moduleCache[name][args] = {}
-            if "kwargs" not in moduleCache[name][args]:
-                moduleCache[name][args][kwargs_tuple] = {}
-            moduleCache[name][args][kwargs_tuple] = mod
-            return mod
+            segments.append(cb.__name__)
+            if inspect.ismethod(cb):
+                try:
+                    # This attribute doesn't exist on py3.x or newer, so
+                    # we optionally ignore it... (on those versions of
+                    # python `__qualname__` should have been found anyway).
+                    segments.insert(0, cb.im_class.__name__)
+                except AttributeError:
+                    pass
+        except AttributeError:
+            pass
+    if not segments:
+        return repr(cb)
+    else:
+        try:
+            # When running under sphinx it appears this can be none?
+            if cb.__module__:
+                segments.insert(0, cb.__module__)
+        except AttributeError:
+            pass
+        return ".".join(segments)
 
-    return moduleFactory
+
+try:
+    now = time.monotonic  # noqa
+except AttributeError:
+    from monotonic import monotonic as now  # noqa
 
 
-def memoize(func):
-    cache = {}
+class cached_property(object):
+    """A property that is computed once per instance.
 
-    def wrapped(*args, **kwargs):
-        key = (tuple(args), tuple(kwargs.items()))
-        if key not in cache:
-            cache[key] = func(*args, **kwargs)
-        return cache[key]
+    Upon being computed it replaces itself with an ordinary attribute. Deleting
+    the attribute resets the property.
 
-    return wrapped
+    Source: https://github.com/bottlepy/bottle/blob/1de24157e74a6971d136550afe1b63eec5b0df2b/bottle.py#L234-L246
+    """  # noqa: E501
+
+    def __init__(self, func):
+        update_wrapper(self, func)
+        self.func = func
+
+    def __get__(self, obj, cls):
+        if obj is None:
+            return self
+        value = obj.__dict__[self.func.__name__] = self.func(obj)
+        return value
