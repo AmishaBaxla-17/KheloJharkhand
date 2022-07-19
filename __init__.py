@@ -1,113 +1,342 @@
+# coding: utf-8
 """
-pip._vendor is for vendoring dependencies of pip to prevent needing pip to
-depend on something external.
 
-Files inside of pip._vendor should be considered immutable and should only be
-updated to versions from upstream.
+    webencodings
+    ~~~~~~~~~~~~
+
+    This is a Python implementation of the `WHATWG Encoding standard
+    <http://encoding.spec.whatwg.org/>`. See README for details.
+
+    :copyright: Copyright 2012 by Simon Sapin
+    :license: BSD, see LICENSE for details.
+
 """
-from __future__ import absolute_import
 
-import glob
-import os.path
-import sys
+from __future__ import unicode_literals
 
-# Downstream redistributors which have debundled our dependencies should also
-# patch this value to be true. This will trigger the additional patching
-# to cause things like "six" to be available as pip.
-DEBUNDLED = False
+import codecs
 
-# By default, look in this directory for a bunch of .whl files which we will
-# add to the beginning of sys.path before attempting to import anything. This
-# is done to support downstream re-distributors like Debian and Fedora who
-# wish to create their own Wheels for our dependencies to aid in debundling.
-WHEEL_DIR = os.path.abspath(os.path.dirname(__file__))
+from .labels import LABELS
 
 
-# Define a small helper function to alias our vendored modules to the real ones
-# if the vendored ones do not exist. This idea of this was taken from
-# https://github.com/kennethreitz/requests/pull/2567.
-def vendored(modulename):
-    vendored_name = "{0}.{1}".format(__name__, modulename)
+VERSION = '0.5.1'
 
-    try:
-        __import__(modulename, globals(), locals(), level=0)
-    except ImportError:
-        # We can just silently allow import failures to pass here. If we
-        # got to this point it means that ``import pip._vendor.whatever``
-        # failed and so did ``import whatever``. Since we're importing this
-        # upfront in an attempt to alias imports, not erroring here will
-        # just mean we get a regular import error whenever pip *actually*
-        # tries to import one of these modules to use it, which actually
-        # gives us a better error message than we would have otherwise
-        # gotten.
-        pass
+
+# Some names in Encoding are not valid Python aliases. Remap these.
+PYTHON_NAMES = {
+    'iso-8859-8-i': 'iso-8859-8',
+    'x-mac-cyrillic': 'mac-cyrillic',
+    'macintosh': 'mac-roman',
+    'windows-874': 'cp874'}
+
+CACHE = {}
+
+
+def ascii_lower(string):
+    r"""Transform (only) ASCII letters to lower case: A-Z is mapped to a-z.
+
+    :param string: An Unicode string.
+    :returns: A new Unicode string.
+
+    This is used for `ASCII case-insensitive
+    <http://encoding.spec.whatwg.org/#ascii-case-insensitive>`_
+    matching of encoding labels.
+    The same matching is also used, among other things,
+    for `CSS keywords <http://dev.w3.org/csswg/css-values/#keywords>`_.
+
+    This is different from the :meth:`~py:str.lower` method of Unicode strings
+    which also affect non-ASCII characters,
+    sometimes mapping them into the ASCII range:
+
+        >>> keyword = u'Bac\N{KELVIN SIGN}ground'
+        >>> assert keyword.lower() == u'background'
+        >>> assert ascii_lower(keyword) != keyword.lower()
+        >>> assert ascii_lower(keyword) == u'bac\N{KELVIN SIGN}ground'
+
+    """
+    # This turns out to be faster than unicode.translate()
+    return string.encode('utf8').lower().decode('utf8')
+
+
+def lookup(label):
+    """
+    Look for an encoding by its label.
+    This is the spec’s `get an encoding
+    <http://encoding.spec.whatwg.org/#concept-encoding-get>`_ algorithm.
+    Supported labels are listed there.
+
+    :param label: A string.
+    :returns:
+        An :class:`Encoding` object, or :obj:`None` for an unknown label.
+
+    """
+    # Only strip ASCII whitespace: U+0009, U+000A, U+000C, U+000D, and U+0020.
+    label = ascii_lower(label.strip('\t\n\f\r '))
+    name = LABELS.get(label)
+    if name is None:
+        return None
+    encoding = CACHE.get(name)
+    if encoding is None:
+        if name == 'x-user-defined':
+            from .x_user_defined import codec_info
+        else:
+            python_name = PYTHON_NAMES.get(name, name)
+            # Any python_name value that gets to here should be valid.
+            codec_info = codecs.lookup(python_name)
+        encoding = Encoding(name, codec_info)
+        CACHE[name] = encoding
+    return encoding
+
+
+def _get_encoding(encoding_or_label):
+    """
+    Accept either an encoding object or label.
+
+    :param encoding: An :class:`Encoding` object or a label string.
+    :returns: An :class:`Encoding` object.
+    :raises: :exc:`~exceptions.LookupError` for an unknown label.
+
+    """
+    if hasattr(encoding_or_label, 'codec_info'):
+        return encoding_or_label
+
+    encoding = lookup(encoding_or_label)
+    if encoding is None:
+        raise LookupError('Unknown encoding label: %r' % encoding_or_label)
+    return encoding
+
+
+class Encoding(object):
+    """Reresents a character encoding such as UTF-8,
+    that can be used for decoding or encoding.
+
+    .. attribute:: name
+
+        Canonical name of the encoding
+
+    .. attribute:: codec_info
+
+        The actual implementation of the encoding,
+        a stdlib :class:`~codecs.CodecInfo` object.
+        See :func:`codecs.register`.
+
+    """
+    def __init__(self, name, codec_info):
+        self.name = name
+        self.codec_info = codec_info
+
+    def __repr__(self):
+        return '<Encoding %s>' % self.name
+
+
+#: The UTF-8 encoding. Should be used for new content and formats.
+UTF8 = lookup('utf-8')
+
+_UTF16LE = lookup('utf-16le')
+_UTF16BE = lookup('utf-16be')
+
+
+def decode(input, fallback_encoding, errors='replace'):
+    """
+    Decode a single string.
+
+    :param input: A byte string
+    :param fallback_encoding:
+        An :class:`Encoding` object or a label string.
+        The encoding to use if :obj:`input` does note have a BOM.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+    :return:
+        A ``(output, encoding)`` tuple of an Unicode string
+        and an :obj:`Encoding`.
+
+    """
+    # Fail early if `encoding` is an invalid label.
+    fallback_encoding = _get_encoding(fallback_encoding)
+    bom_encoding, input = _detect_bom(input)
+    encoding = bom_encoding or fallback_encoding
+    return encoding.codec_info.decode(input, errors)[0], encoding
+
+
+def _detect_bom(input):
+    """Return (bom_encoding, input), with any BOM removed from the input."""
+    if input.startswith(b'\xFF\xFE'):
+        return _UTF16LE, input[2:]
+    if input.startswith(b'\xFE\xFF'):
+        return _UTF16BE, input[2:]
+    if input.startswith(b'\xEF\xBB\xBF'):
+        return UTF8, input[3:]
+    return None, input
+
+
+def encode(input, encoding=UTF8, errors='strict'):
+    """
+    Encode a single string.
+
+    :param input: An Unicode string.
+    :param encoding: An :class:`Encoding` object or a label string.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+    :return: A byte string.
+
+    """
+    return _get_encoding(encoding).codec_info.encode(input, errors)[0]
+
+
+def iter_decode(input, fallback_encoding, errors='replace'):
+    """
+    "Pull"-based decoder.
+
+    :param input:
+        An iterable of byte strings.
+
+        The input is first consumed just enough to determine the encoding
+        based on the precense of a BOM,
+        then consumed on demand when the return value is.
+    :param fallback_encoding:
+        An :class:`Encoding` object or a label string.
+        The encoding to use if :obj:`input` does note have a BOM.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+    :returns:
+        An ``(output, encoding)`` tuple.
+        :obj:`output` is an iterable of Unicode strings,
+        :obj:`encoding` is the :obj:`Encoding` that is being used.
+
+    """
+
+    decoder = IncrementalDecoder(fallback_encoding, errors)
+    generator = _iter_decode_generator(input, decoder)
+    encoding = next(generator)
+    return generator, encoding
+
+
+def _iter_decode_generator(input, decoder):
+    """Return a generator that first yields the :obj:`Encoding`,
+    then yields output chukns as Unicode strings.
+
+    """
+    decode = decoder.decode
+    input = iter(input)
+    for chunck in input:
+        output = decode(chunck)
+        if output:
+            assert decoder.encoding is not None
+            yield decoder.encoding
+            yield output
+            break
     else:
-        sys.modules[vendored_name] = sys.modules[modulename]
-        base, head = vendored_name.rsplit(".", 1)
-        setattr(sys.modules[base], head, sys.modules[modulename])
+        # Input exhausted without determining the encoding
+        output = decode(b'', final=True)
+        assert decoder.encoding is not None
+        yield decoder.encoding
+        if output:
+            yield output
+        return
+
+    for chunck in input:
+        output = decode(chunck)
+        if output:
+            yield output
+    output = decode(b'', final=True)
+    if output:
+        yield output
 
 
-# If we're operating in a debundled setup, then we want to go ahead and trigger
-# the aliasing of our vendored libraries as well as looking for wheels to add
-# to our sys.path. This will cause all of this code to be a no-op typically
-# however downstream redistributors can enable it in a consistent way across
-# all platforms.
-if DEBUNDLED:
-    # Actually look inside of WHEEL_DIR to find .whl files and add them to the
-    # front of our sys.path.
-    sys.path[:] = glob.glob(os.path.join(WHEEL_DIR, "*.whl")) + sys.path
+def iter_encode(input, encoding=UTF8, errors='strict'):
+    """
+    “Pull”-based encoder.
 
-    # Actually alias all of our vendored dependencies.
-    vendored("appdirs")
-    vendored("cachecontrol")
-    vendored("certifi")
-    vendored("colorama")
-    vendored("distlib")
-    vendored("distro")
-    vendored("html5lib")
-    vendored("six")
-    vendored("six.moves")
-    vendored("six.moves.urllib")
-    vendored("six.moves.urllib.parse")
-    vendored("packaging")
-    vendored("packaging.version")
-    vendored("packaging.specifiers")
-    vendored("pep517")
-    vendored("pkg_resources")
-    vendored("progress")
-    vendored("requests")
-    vendored("requests.exceptions")
-    vendored("requests.packages")
-    vendored("requests.packages.urllib3")
-    vendored("requests.packages.urllib3._collections")
-    vendored("requests.packages.urllib3.connection")
-    vendored("requests.packages.urllib3.connectionpool")
-    vendored("requests.packages.urllib3.contrib")
-    vendored("requests.packages.urllib3.contrib.ntlmpool")
-    vendored("requests.packages.urllib3.contrib.pyopenssl")
-    vendored("requests.packages.urllib3.exceptions")
-    vendored("requests.packages.urllib3.fields")
-    vendored("requests.packages.urllib3.filepost")
-    vendored("requests.packages.urllib3.packages")
-    vendored("requests.packages.urllib3.packages.ordered_dict")
-    vendored("requests.packages.urllib3.packages.six")
-    vendored("requests.packages.urllib3.packages.ssl_match_hostname")
-    vendored("requests.packages.urllib3.packages.ssl_match_hostname."
-             "_implementation")
-    vendored("requests.packages.urllib3.poolmanager")
-    vendored("requests.packages.urllib3.request")
-    vendored("requests.packages.urllib3.response")
-    vendored("requests.packages.urllib3.util")
-    vendored("requests.packages.urllib3.util.connection")
-    vendored("requests.packages.urllib3.util.request")
-    vendored("requests.packages.urllib3.util.response")
-    vendored("requests.packages.urllib3.util.retry")
-    vendored("requests.packages.urllib3.util.ssl_")
-    vendored("requests.packages.urllib3.util.timeout")
-    vendored("requests.packages.urllib3.util.url")
-    vendored("resolvelib")
-    vendored("tenacity")
-    vendored("toml")
-    vendored("toml.encoder")
-    vendored("toml.decoder")
-    vendored("urllib3")
+    :param input: An iterable of Unicode strings.
+    :param encoding: An :class:`Encoding` object or a label string.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+    :returns: An iterable of byte strings.
+
+    """
+    # Fail early if `encoding` is an invalid label.
+    encode = IncrementalEncoder(encoding, errors).encode
+    return _iter_encode_generator(input, encode)
+
+
+def _iter_encode_generator(input, encode):
+    for chunck in input:
+        output = encode(chunck)
+        if output:
+            yield output
+    output = encode('', final=True)
+    if output:
+        yield output
+
+
+class IncrementalDecoder(object):
+    """
+    “Push”-based decoder.
+
+    :param fallback_encoding:
+        An :class:`Encoding` object or a label string.
+        The encoding to use if :obj:`input` does note have a BOM.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+
+    """
+    def __init__(self, fallback_encoding, errors='replace'):
+        # Fail early if `encoding` is an invalid label.
+        self._fallback_encoding = _get_encoding(fallback_encoding)
+        self._errors = errors
+        self._buffer = b''
+        self._decoder = None
+        #: The actual :class:`Encoding` that is being used,
+        #: or :obj:`None` if that is not determined yet.
+        #: (Ie. if there is not enough input yet to determine
+        #: if there is a BOM.)
+        self.encoding = None  # Not known yet.
+
+    def decode(self, input, final=False):
+        """Decode one chunk of the input.
+
+        :param input: A byte string.
+        :param final:
+            Indicate that no more input is available.
+            Must be :obj:`True` if this is the last call.
+        :returns: An Unicode string.
+
+        """
+        decoder = self._decoder
+        if decoder is not None:
+            return decoder(input, final)
+
+        input = self._buffer + input
+        encoding, input = _detect_bom(input)
+        if encoding is None:
+            if len(input) < 3 and not final:  # Not enough data yet.
+                self._buffer = input
+                return ''
+            else:  # No BOM
+                encoding = self._fallback_encoding
+        decoder = encoding.codec_info.incrementaldecoder(self._errors).decode
+        self._decoder = decoder
+        self.encoding = encoding
+        return decoder(input, final)
+
+
+class IncrementalEncoder(object):
+    """
+    “Push”-based encoder.
+
+    :param encoding: An :class:`Encoding` object or a label string.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+
+    .. method:: encode(input, final=False)
+
+        :param input: An Unicode string.
+        :param final:
+            Indicate that no more input is available.
+            Must be :obj:`True` if this is the last call.
+        :returns: A byte string.
+
+    """
+    def __init__(self, encoding=UTF8, errors='strict'):
+        encoding = _get_encoding(encoding)
+        self.encode = encoding.codec_info.incrementalencoder(errors).encode
