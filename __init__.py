@@ -1,22 +1,49 @@
-import sys
+from __future__ import absolute_import
 
-try:
-    # Our match_hostname function is the same as 3.5's, so we only want to
-    # import the match_hostname function if it's at least that good.
-    if sys.version_info < (3, 5):
-        raise ImportError("Fallback to vendored code")
+# For backwards compatibility, provide imports that used to be here.
+from .connection import is_connection_dropped
+from .request import SKIP_HEADER, SKIPPABLE_HEADERS, make_headers
+from .response import is_fp_closed
+from .retry import Retry
+from .ssl_ import (
+    ALPN_PROTOCOLS,
+    HAS_SNI,
+    IS_PYOPENSSL,
+    IS_SECURETRANSPORT,
+    PROTOCOL_TLS,
+    SSLContext,
+    assert_fingerprint,
+    resolve_cert_reqs,
+    resolve_ssl_version,
+    ssl_wrap_socket,
+)
+from .timeout import Timeout, current_time
+from .url import Url, get_host, parse_url, split_first
+from .wait import wait_for_read, wait_for_write
 
-    from ssl import CertificateError, match_hostname
-except ImportError:
-    try:
-        # Backport of the function from a pypi module
-        from backports.ssl_match_hostname import (  # type: ignore
-            CertificateError,
-            match_hostname,
-        )
-    except ImportError:
-        # Our vendored copy
-        from ._implementation import CertificateError, match_hostname  # type: ignore
-
-# Not needed, but documenting what we provide.
-__all__ = ("CertificateError", "match_hostname")
+__all__ = (
+    "HAS_SNI",
+    "IS_PYOPENSSL",
+    "IS_SECURETRANSPORT",
+    "SSLContext",
+    "PROTOCOL_TLS",
+    "ALPN_PROTOCOLS",
+    "Retry",
+    "Timeout",
+    "Url",
+    "assert_fingerprint",
+    "current_time",
+    "is_connection_dropped",
+    "is_fp_closed",
+    "get_host",
+    "parse_url",
+    "make_headers",
+    "resolve_cert_reqs",
+    "resolve_ssl_version",
+    "split_first",
+    "ssl_wrap_socket",
+    "wait_for_read",
+    "wait_for_write",
+    "SKIP_HEADER",
+    "SKIPPABLE_HEADERS",
+)
