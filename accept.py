@@ -2,10 +2,10 @@ import typing as t
 import warnings
 
 
-class UserAgentMixin:
+class AcceptMixin:
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
         warnings.warn(
-            "'UserAgentMixin' is deprecated and will be removed in"
+            "'AcceptMixin' is deprecated and will be removed in"
             " Werkzeug 2.1. 'Request' now includes the functionality"
             " directly.",
             DeprecationWarning,

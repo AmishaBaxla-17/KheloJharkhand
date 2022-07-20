@@ -2,23 +2,23 @@ import typing as t
 import warnings
 
 
-class AuthorizationMixin:
+class CommonRequestDescriptorsMixin:
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
         warnings.warn(
-            "'AuthorizationMixin' is deprecated and will be removed in"
-            " Werkzeug 2.1. 'Request' now includes the functionality"
-            " directly.",
+            "'CommonRequestDescriptorsMixin' is deprecated and will be"
+            " removed in Werkzeug 2.1. 'Request' now includes the"
+            " functionality directly.",
             DeprecationWarning,
             stacklevel=2,
         )
         super().__init__(*args, **kwargs)  # type: ignore
 
 
-class WWWAuthenticateMixin:
+class CommonResponseDescriptorsMixin:
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
         warnings.warn(
-            "'WWWAuthenticateMixin' is deprecated and will be removed"
-            " in Werkzeug 2.1. 'Response' now includes the"
+            "'CommonResponseDescriptorsMixin' is deprecated and will be"
+            " removed in Werkzeug 2.1. 'Response' now includes the"
             " functionality directly.",
             DeprecationWarning,
             stacklevel=2,

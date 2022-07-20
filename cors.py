@@ -2,10 +2,10 @@ import typing as t
 import warnings
 
 
-class AuthorizationMixin:
+class CORSRequestMixin:
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
         warnings.warn(
-            "'AuthorizationMixin' is deprecated and will be removed in"
+            "'CORSRequestMixin' is deprecated and will be removed in"
             " Werkzeug 2.1. 'Request' now includes the functionality"
             " directly.",
             DeprecationWarning,
@@ -14,12 +14,12 @@ class AuthorizationMixin:
         super().__init__(*args, **kwargs)  # type: ignore
 
 
-class WWWAuthenticateMixin:
+class CORSResponseMixin:
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
         warnings.warn(
-            "'WWWAuthenticateMixin' is deprecated and will be removed"
-            " in Werkzeug 2.1. 'Response' now includes the"
-            " functionality directly.",
+            "'CORSResponseMixin' is deprecated and will be removed in"
+            " Werkzeug 2.1. 'Response' now includes the functionality"
+            " directly.",
             DeprecationWarning,
             stacklevel=2,
         )
