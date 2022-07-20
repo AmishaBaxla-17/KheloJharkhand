@@ -1,15 +1,6 @@
-"""distutils
+from .serving import run_simple as run_simple
+from .test import Client as Client
+from .wrappers import Request as Request
+from .wrappers import Response as Response
 
-The main package for the Python Module Distribution Utilities.  Normally
-used from a setup script as
-
-   from distutils.core import setup
-
-   setup (...)
-"""
-
-import sys
-
-__version__ = sys.version[:sys.version.index(' ')]
-
-local = True
+__version__ = "2.0.2"
