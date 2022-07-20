@@ -8,21 +8,13 @@ import os
 import platform
 import sys
 
-from pip._vendor.pyparsing import (  # noqa: N817
-    Forward,
-    Group,
-    Literal as L,
-    ParseException,
-    ParseResults,
-    QuotedString,
-    ZeroOrMore,
-    stringEnd,
-    stringStart,
-)
+from pkg_resources.extern.pyparsing import ParseException, ParseResults, stringStart, stringEnd
+from pkg_resources.extern.pyparsing import ZeroOrMore, Group, Forward, QuotedString
+from pkg_resources.extern.pyparsing import Literal as L  # noqa
 
 from ._compat import string_types
 from ._typing import TYPE_CHECKING
-from .specifiers import InvalidSpecifier, Specifier
+from .specifiers import Specifier, InvalidSpecifier
 
 if TYPE_CHECKING:  # pragma: no cover
     from typing import Any, Callable, Dict, List, Optional, Tuple, Union

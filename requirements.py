@@ -3,35 +3,20 @@
 # for complete details.
 from __future__ import absolute_import, division, print_function
 
-import re
 import string
-import sys
+import re
 
-from pip._vendor.pyparsing import (  # noqa: N817
-    Combine,
-    Literal as L,
-    Optional,
-    ParseException,
-    Regex,
-    Word,
-    ZeroOrMore,
-    originalTextFor,
-    stringEnd,
-    stringStart,
-)
+from pkg_resources.extern.pyparsing import stringStart, stringEnd, originalTextFor, ParseException
+from pkg_resources.extern.pyparsing import ZeroOrMore, Word, Optional, Regex, Combine
+from pkg_resources.extern.pyparsing import Literal as L  # noqa
+from urllib import parse as urlparse
 
 from ._typing import TYPE_CHECKING
 from .markers import MARKER_EXPR, Marker
 from .specifiers import LegacySpecifier, Specifier, SpecifierSet
 
-if sys.version_info[0] >= 3:
-    from urllib import parse as urlparse  # pragma: no cover
-else:  # pragma: no cover
-    import urlparse
-
-
 if TYPE_CHECKING:  # pragma: no cover
-    from typing import List, Optional as TOptional, Set
+    from typing import List
 
 
 class InvalidRequirement(ValueError):
@@ -89,7 +74,7 @@ URL_AND_MARKER = URL + Optional(MARKER)
 NAMED_REQUIREMENT = NAME + Optional(EXTRAS) + (URL_AND_MARKER | VERSION_AND_MARKER)
 
 REQUIREMENT = stringStart + NAMED_REQUIREMENT + stringEnd
-# pyparsing isn't thread safe during initialization, so we do it eagerly, see
+# pkg_resources.extern.pyparsing isn't thread safe during initialization, so we do it eagerly, see
 # issue #104
 REQUIREMENT.parseString("x[]")
 
@@ -118,7 +103,7 @@ class Requirement(object):
                 )
             )
 
-        self.name = req.name  # type: str
+        self.name = req.name
         if req.url:
             parsed_url = urlparse.urlparse(req.url)
             if parsed_url.scheme == "file":
@@ -128,12 +113,12 @@ class Requirement(object):
                 not parsed_url.scheme and not parsed_url.netloc
             ):
                 raise InvalidRequirement("Invalid URL: {0}".format(req.url))
-            self.url = req.url  # type: TOptional[str]
+            self.url = req.url
         else:
             self.url = None
-        self.extras = set(req.extras.asList() if req.extras else [])  # type: Set[str]
-        self.specifier = SpecifierSet(req.specifier)  # type: SpecifierSet
-        self.marker = req.marker if req.marker else None  # type: TOptional[Marker]
+        self.extras = set(req.extras.asList() if req.extras else [])
+        self.specifier = SpecifierSet(req.specifier)
+        self.marker = req.marker if req.marker else None
 
     def __str__(self):
         # type: () -> str
