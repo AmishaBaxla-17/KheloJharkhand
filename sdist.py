@@ -1,95 +1,235 @@
-import logging
-from typing import Set, Tuple
+from distutils import log
+import distutils.command.sdist as orig
+import os
+import sys
+import io
+import contextlib
+from glob import iglob
 
-from pip._vendor.pkg_resources import Distribution
+from setuptools.extern import ordered_set
 
-from pip._internal.build_env import BuildEnvironment
-from pip._internal.distributions.base import AbstractDistribution
-from pip._internal.exceptions import InstallationError
-from pip._internal.index.package_finder import PackageFinder
-from pip._internal.utils.subprocess import runner_with_spinner_message
+from .py36compat import sdist_add_defaults
 
-logger = logging.getLogger(__name__)
+import pkg_resources
+
+_default_revctrl = list
 
 
-class SourceDistribution(AbstractDistribution):
-    """Represents a source distribution.
+def walk_revctrl(dirname=''):
+    """Find all files under revision control"""
+    for ep in pkg_resources.iter_entry_points('setuptools.file_finders'):
+        for item in ep.load()(dirname):
+            yield item
 
-    The preparation step for these needs metadata for the packages to be
-    generated, either using PEP 517 or using the legacy `setup.py egg_info`.
-    """
 
-    def get_pkg_resources_distribution(self):
-        # type: () -> Distribution
-        return self.req.get_dist()
+class sdist(sdist_add_defaults, orig.sdist):
+    """Smart sdist that finds anything supported by revision control"""
 
-    def prepare_distribution_metadata(self, finder, build_isolation):
-        # type: (PackageFinder, bool) -> None
-        # Load pyproject.toml, to determine whether PEP 517 is to be used
-        self.req.load_pyproject_toml()
+    user_options = [
+        ('formats=', None,
+         "formats for source distribution (comma-separated list)"),
+        ('keep-temp', 'k',
+         "keep the distribution tree around after creating " +
+         "archive file(s)"),
+        ('dist-dir=', 'd',
+         "directory to put the source distribution archive(s) in "
+         "[default: dist]"),
+    ]
 
-        # Set up the build isolation, if this requirement should be isolated
-        should_isolate = self.req.use_pep517 and build_isolation
-        if should_isolate:
-            self._setup_isolation(finder)
+    negative_opt = {}
 
-        self.req.prepare_metadata()
+    README_EXTENSIONS = ['', '.rst', '.txt', '.md']
+    READMES = tuple('README{0}'.format(ext) for ext in README_EXTENSIONS)
 
-    def _setup_isolation(self, finder):
-        # type: (PackageFinder) -> None
-        def _raise_conflicts(conflicting_with, conflicting_reqs):
-            # type: (str, Set[Tuple[str, str]]) -> None
-            format_string = (
-                "Some build dependencies for {requirement} "
-                "conflict with {conflicting_with}: {description}."
-            )
-            error_message = format_string.format(
-                requirement=self.req,
-                conflicting_with=conflicting_with,
-                description=", ".join(
-                    f"{installed} is incompatible with {wanted}"
-                    for installed, wanted in sorted(conflicting)
-                ),
-            )
-            raise InstallationError(error_message)
+    def run(self):
+        self.run_command('egg_info')
+        ei_cmd = self.get_finalized_command('egg_info')
+        self.filelist = ei_cmd.filelist
+        self.filelist.append(os.path.join(ei_cmd.egg_info, 'SOURCES.txt'))
+        self.check_readme()
 
-        # Isolate in a BuildEnvironment and install the build-time
-        # requirements.
-        pyproject_requires = self.req.pyproject_requires
-        assert pyproject_requires is not None
+        # Run sub commands
+        for cmd_name in self.get_sub_commands():
+            self.run_command(cmd_name)
 
-        self.req.build_env = BuildEnvironment()
-        self.req.build_env.install_requirements(
-            finder, pyproject_requires, "overlay", "Installing build dependencies"
+        self.make_distribution()
+
+        dist_files = getattr(self.distribution, 'dist_files', [])
+        for file in self.archive_files:
+            data = ('sdist', '', file)
+            if data not in dist_files:
+                dist_files.append(data)
+
+    def initialize_options(self):
+        orig.sdist.initialize_options(self)
+
+        self._default_to_gztar()
+
+    def _default_to_gztar(self):
+        # only needed on Python prior to 3.6.
+        if sys.version_info >= (3, 6, 0, 'beta', 1):
+            return
+        self.formats = ['gztar']
+
+    def make_distribution(self):
+        """
+        Workaround for #516
+        """
+        with self._remove_os_link():
+            orig.sdist.make_distribution(self)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _remove_os_link():
+        """
+        In a context, remove and restore os.link if it exists
+        """
+
+        class NoValue:
+            pass
+
+        orig_val = getattr(os, 'link', NoValue)
+        try:
+            del os.link
+        except Exception:
+            pass
+        try:
+            yield
+        finally:
+            if orig_val is not NoValue:
+                setattr(os, 'link', orig_val)
+
+    def _add_defaults_optional(self):
+        super()._add_defaults_optional()
+        if os.path.isfile('pyproject.toml'):
+            self.filelist.append('pyproject.toml')
+
+    def _add_defaults_python(self):
+        """getting python files"""
+        if self.distribution.has_pure_modules():
+            build_py = self.get_finalized_command('build_py')
+            self.filelist.extend(build_py.get_source_files())
+            self._add_data_files(self._safe_data_files(build_py))
+
+    def _safe_data_files(self, build_py):
+        """
+        Extracting data_files from build_py is known to cause
+        infinite recursion errors when `include_package_data`
+        is enabled, so suppress it in that case.
+        """
+        if self.distribution.include_package_data:
+            return ()
+        return build_py.data_files
+
+    def _add_data_files(self, data_files):
+        """
+        Add data files as found in build_py.data_files.
+        """
+        self.filelist.extend(
+            os.path.join(src_dir, name)
+            for _, src_dir, _, filenames in data_files
+            for name in filenames
         )
-        conflicting, missing = self.req.build_env.check_requirements(
-            self.req.requirements_to_check
-        )
-        if conflicting:
-            _raise_conflicts("PEP 517/518 supported requirements", conflicting)
-        if missing:
-            logger.warning(
-                "Missing build requirements in pyproject.toml for %s.",
-                self.req,
-            )
-            logger.warning(
-                "The project does not specify a build backend, and "
-                "pip cannot fall back to setuptools without %s.",
-                " and ".join(map(repr, sorted(missing))),
-            )
-        # Install any extra build dependencies that the backend requests.
-        # This must be done in a second pass, as the pyproject.toml
-        # dependencies must be installed before we can call the backend.
-        with self.req.build_env:
-            runner = runner_with_spinner_message("Getting requirements to build wheel")
-            backend = self.req.pep517_backend
-            assert backend is not None
-            with backend.subprocess_runner(runner):
-                reqs = backend.get_requires_for_build_wheel()
 
-        conflicting, missing = self.req.build_env.check_requirements(reqs)
-        if conflicting:
-            _raise_conflicts("the backend dependencies", conflicting)
-        self.req.build_env.install_requirements(
-            finder, missing, "normal", "Installing backend dependencies"
-        )
+    def _add_defaults_data_files(self):
+        try:
+            super()._add_defaults_data_files()
+        except TypeError:
+            log.warn("data_files contains unexpected objects")
+
+    def check_readme(self):
+        for f in self.READMES:
+            if os.path.exists(f):
+                return
+        else:
+            self.warn(
+                "standard file not found: should have one of " +
+                ', '.join(self.READMES)
+            )
+
+    def make_release_tree(self, base_dir, files):
+        orig.sdist.make_release_tree(self, base_dir, files)
+
+        # Save any egg_info command line options used to create this sdist
+        dest = os.path.join(base_dir, 'setup.cfg')
+        if hasattr(os, 'link') and os.path.exists(dest):
+            # unlink and re-copy, since it might be hard-linked, and
+            # we don't want to change the source version
+            os.unlink(dest)
+            self.copy_file('setup.cfg', dest)
+
+        self.get_finalized_command('egg_info').save_version_info(dest)
+
+    def _manifest_is_not_generated(self):
+        # check for special comment used in 2.7.1 and higher
+        if not os.path.isfile(self.manifest):
+            return False
+
+        with io.open(self.manifest, 'rb') as fp:
+            first_line = fp.readline()
+        return (first_line !=
+                '# file GENERATED by distutils, do NOT edit\n'.encode())
+
+    def read_manifest(self):
+        """Read the manifest file (named by 'self.manifest') and use it to
+        fill in 'self.filelist', the list of files to include in the source
+        distribution.
+        """
+        log.info("reading manifest file '%s'", self.manifest)
+        manifest = open(self.manifest, 'rb')
+        for line in manifest:
+            # The manifest must contain UTF-8. See #303.
+            try:
+                line = line.decode('UTF-8')
+            except UnicodeDecodeError:
+                log.warn("%r not UTF-8 decodable -- skipping" % line)
+                continue
+            # ignore comments and blank lines
+            line = line.strip()
+            if line.startswith('#') or not line:
+                continue
+            self.filelist.append(line)
+        manifest.close()
+
+    def check_license(self):
+        """Checks if license_file' or 'license_files' is configured and adds any
+        valid paths to 'self.filelist'.
+        """
+        opts = self.distribution.get_option_dict('metadata')
+
+        files = ordered_set.OrderedSet()
+        try:
+            license_files = self.distribution.metadata.license_files
+        except TypeError:
+            log.warn("warning: 'license_files' option is malformed")
+            license_files = ordered_set.OrderedSet()
+        patterns = license_files if isinstance(license_files, ordered_set.OrderedSet) \
+            else ordered_set.OrderedSet(license_files)
+
+        if 'license_file' in opts:
+            log.warn(
+                "warning: the 'license_file' option is deprecated, "
+                "use 'license_files' instead")
+            patterns.append(opts['license_file'][1])
+
+        if 'license_file' not in opts and 'license_files' not in opts:
+            # Default patterns match the ones wheel uses
+            # See https://wheel.readthedocs.io/en/stable/user_guide.html
+            # -> 'Including license files in the generated wheel file'
+            patterns = ('LICEN[CS]E*', 'COPYING*', 'NOTICE*', 'AUTHORS*')
+
+        for pattern in patterns:
+            for path in iglob(pattern):
+                if path.endswith('~'):
+                    log.debug(
+                        "ignoring license file '%s' as it looks like a backup",
+                        path)
+                    continue
+
+                if path not in files and os.path.isfile(path):
+                    log.info(
+                        "adding license file '%s' (matched pattern '%s')",
+                        path, pattern)
+                    files.add(path)
+
+        self.filelist.extend(sorted(files))
